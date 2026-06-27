@@ -10,13 +10,7 @@ from vllm.v1.sample.logits_processor import AdapterLogitsProcessor
 
 
 class ForcedDecodeLogitsProcessor(AdapterLogitsProcessor):
-    """Force each request to emit the target tokens in SamplingParams.extra_args.
-
-    The sampler computes raw logprobs before applying logits processors. The
-    benchmark requests a dummy logprob token id only to trigger raw-logprob
-    capture, then reads the sampled token's raw logprob after this processor
-    forces that sampled token to the target continuation.
-    """
+    """Force requests to emit the target tokens from SamplingParams.extra_args."""
 
     @classmethod
     def validate_params(cls, sampling_params: SamplingParams):

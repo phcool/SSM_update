@@ -123,7 +123,7 @@ def main() -> None:
         gpu_memory_utilization=args.gpu_memory_utilization,
         language_model_only=True,
         logits_processors=[
-            "benchmarks.replayssm.forced_decode_logits_processor:"
+            "vllm.v1.sample.logits_processor.forced_decode:"
             "ForcedDecodeLogitsProcessor",
         ],
         use_replayssm=True,
