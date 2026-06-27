@@ -203,9 +203,16 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                         "page (conv, ssm, x_cache, dt_cache, B_cache)"
                     )
                 bc_ngroups = kv_cache_spec.shapes[4][0]
+                # This is a per-step scratch consumed by the output-only
+                # ReplaySSM decode kernel. It must cover eager/no-cudagraph
+                # decode too, where decode_cudagraph_max_bs can be 0.
+                scratch_bs = max(
+                    self.decode_cudagraph_max_bs,
+                    scheduler_config.max_num_seqs,
+                )
                 self.decode_bc_pre_scratch: torch.Tensor = torch.empty(
                     (
-                        self.decode_cudagraph_max_bs,
+                        scratch_bs,
                         bc_ngroups,
                         self.max_cache_len,
                     ),
