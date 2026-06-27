@@ -118,7 +118,7 @@ def main() -> None:
         enable_chunked_prefill=False,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_model_len * args.max_num_seqs,
-        enforce_eager=False,
+        enforce_eager=True,
         disable_log_stats=True,
         gpu_memory_utilization=args.gpu_memory_utilization,
         language_model_only=True,
