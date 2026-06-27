@@ -32,6 +32,12 @@ def parse_args() -> argparse.Namespace:
         help="Cache write position to profile. Defaults to buffer_len//2 for "
         "nonflush and buffer_len-1 for flush.",
     )
+    parser.add_argument(
+        "--allow-artificial-state",
+        action="store_true",
+        help="Allow mode/write_pos combinations that cannot occur in normal "
+        "ReplaySSM decode scheduling, such as nonflush at buffer_len-1.",
+    )
     return parser.parse_args()
 
 
@@ -91,6 +97,17 @@ def main() -> None:
     if not 0 <= write_pos_value < max_cache_len:
         raise ValueError(
             f"write_pos must be in [0, {max_cache_len}), got {write_pos_value}")
+    natural_flush = write_pos_value == max_cache_len - 1
+    if not args.allow_artificial_state:
+        if args.mode == "nonflush" and natural_flush:
+            raise ValueError(
+                "nonflush with write_pos=buffer_len-1 is not a normal "
+                "ReplaySSM decode state; use --allow-artificial-state to "
+                "profile this synthetic combination.")
+        if args.mode == "flush" and not natural_flush:
+            raise ValueError(
+                "flush normally occurs only at write_pos=buffer_len-1; use "
+                "--allow-artificial-state to profile this synthetic combination.")
 
     if args.mode == "flush":
         write_pos = torch.full((batch,), write_pos_value,
