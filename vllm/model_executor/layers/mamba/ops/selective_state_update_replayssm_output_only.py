@@ -51,10 +51,11 @@ def _mx8_fake_quant_dequant(x: torch.Tensor, block_size: int) -> torch.Tensor:
     amax = torch.amax(torch.abs(x_blocks), dim=-1, keepdim=True)
     scale = torch.where(
         amax > 0,
-        torch.pow(2.0, torch.floor(torch.log2(amax / _MX8_FP8_MAX))),
+        torch.pow(2.0, torch.ceil(torch.log2(amax / _MX8_FP8_MAX))),
         torch.ones_like(amax),
     )
-    q = (x_blocks / scale).to(torch.float8_e4m3fn)
+    scaled = torch.clamp(x_blocks / scale, -_MX8_FP8_MAX, _MX8_FP8_MAX)
+    q = scaled.to(torch.float8_e4m3fn)
     dq = q.to(torch.float32) * scale
     dq = dq.reshape(*x_float.shape)
     if pad:
