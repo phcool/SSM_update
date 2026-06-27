@@ -18,7 +18,7 @@ from vllm import LLM, SamplingParams
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="nvidia/Nemotron-H-8B-Base-8K")
-    parser.add_argument("--dataset", default="wikitext")
+    parser.add_argument("--dataset", default="Salesforce/wikitext")
     parser.add_argument("--dataset-config", default="wikitext-2-raw-v1")
     parser.add_argument("--split", default="test")
     parser.add_argument("--quant-mode", choices=("none", "b", "x", "bx"),
