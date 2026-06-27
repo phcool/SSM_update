@@ -2,11 +2,102 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # ruff: noqa: E501
 
+import os
+
 import torch
 
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import softplus
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+
+_MX8_FP8_MAX = 448.0
+
+
+def _get_replayssm_mx8_quant_mode() -> str:
+    mode = os.getenv("REPLAYSSM_MX8_QUANT", "none").strip().lower()
+    if mode in ("", "0", "false", "none", "off"):
+        return "none"
+    if mode not in ("b", "x", "bx", "xb"):
+        raise ValueError(
+            "REPLAYSSM_MX8_QUANT must be one of none, b, x, bx; "
+            f"got {mode!r}")
+    return "bx" if mode == "xb" else mode
+
+
+def _get_replayssm_mx8_block_size() -> int:
+    block_size = int(os.getenv("REPLAYSSM_MX8_BLOCK_SIZE", "32"))
+    if block_size <= 0:
+        raise ValueError("REPLAYSSM_MX8_BLOCK_SIZE must be positive")
+    return block_size
+
+
+def _mx8_fake_quant_dequant(x: torch.Tensor, block_size: int) -> torch.Tensor:
+    """Fake MX8 quantization with e4m3 values and power-of-two block scales."""
+    if x.numel() == 0:
+        return x
+    if not hasattr(torch, "float8_e4m3fn"):
+        raise RuntimeError("MX8 fake quant requires torch.float8_e4m3fn support")
+
+    orig_shape = x.shape
+    orig_dtype = x.dtype
+    last_dim = orig_shape[-1]
+    x_float = x.to(torch.float32)
+    pad = (-last_dim) % block_size
+    if pad:
+        x_float = torch.nn.functional.pad(x_float, (0, pad))
+    x_blocks = x_float.reshape(-1, x_float.shape[-1] // block_size, block_size)
+
+    amax = torch.amax(torch.abs(x_blocks), dim=-1, keepdim=True)
+    scale = torch.where(
+        amax > 0,
+        torch.pow(2.0, torch.floor(torch.log2(amax / _MX8_FP8_MAX))),
+        torch.ones_like(amax),
+    )
+    q = (x_blocks / scale).to(torch.float8_e4m3fn)
+    dq = q.to(torch.float32) * scale
+    dq = dq.reshape(*x_float.shape)
+    if pad:
+        dq = dq[..., :last_dim]
+    return dq.reshape(orig_shape).to(orig_dtype)
+
+
+def _fake_quantize_replayssm_cache_slots(
+    x_cache: torch.Tensor,
+    B_cache: torch.Tensor,
+    write_pos: torch.Tensor,
+    is_flush: torch.Tensor,
+    batch: int,
+    state_batch_indices: torch.Tensor | None,
+    null_block_id: int,
+) -> None:
+    mode = _get_replayssm_mx8_quant_mode()
+    if mode == "none":
+        return
+
+    if state_batch_indices is None:
+        state_indices = torch.arange(batch, device=write_pos.device)
+    else:
+        state_indices = state_batch_indices[:batch, 0]
+        state_indices = state_indices.to(device=write_pos.device)
+
+    positions = write_pos[:batch]
+    valid = (state_indices != null_block_id) & ~is_flush[:batch].bool()
+    if not torch.any(valid):
+        return
+
+    state_indices = state_indices[valid].long()
+    positions = positions[valid].long()
+    block_size = _get_replayssm_mx8_block_size()
+
+    if "x" in mode:
+        x_slots = x_cache[state_indices, :, positions, :]
+        x_cache[state_indices, :, positions, :] = _mx8_fake_quant_dequant(
+            x_slots, block_size)
+    if "b" in mode:
+        B_slots = B_cache[state_indices, :, positions, :]
+        B_cache[state_indices, :, positions, :] = _mx8_fake_quant_dequant(
+            B_slots, block_size)
 
 
 @triton.heuristics(
@@ -546,6 +637,16 @@ def selective_state_update_replayssm_output_only(
             block_size_k_dot,
             num_warps=num_warps,
         )
+
+    _fake_quantize_replayssm_cache_slots(
+        x_cache,
+        B_cache,
+        write_pos,
+        is_flush,
+        batch,
+        state_batch_indices,
+        null_block_id,
+    )
 
     if not has_heads:
         out = out.squeeze(1)
