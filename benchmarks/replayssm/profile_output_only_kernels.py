@@ -25,6 +25,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--headdim", type=int, default=64)
     parser.add_argument("--dstate", type=int, default=128)
     parser.add_argument("--buffer-len", type=int, default=8)
+    parser.add_argument(
+        "--write-pos",
+        type=int,
+        default=None,
+        help="Cache write position to profile. Defaults to buffer_len//2 for "
+        "nonflush and buffer_len-1 for flush.",
+    )
     return parser.parse_args()
 
 
@@ -77,12 +84,20 @@ def main() -> None:
     bc_pre = torch.empty(batch, ngroups, max_cache_len,
                          device=device, dtype=torch.float32)
 
+    if args.write_pos is None:
+        write_pos_value = max_cache_len - 1 if args.mode == "flush" else max_cache_len // 2
+    else:
+        write_pos_value = args.write_pos
+    if not 0 <= write_pos_value < max_cache_len:
+        raise ValueError(
+            f"write_pos must be in [0, {max_cache_len}), got {write_pos_value}")
+
     if args.mode == "flush":
-        write_pos = torch.full((batch,), max_cache_len - 1,
+        write_pos = torch.full((batch,), write_pos_value,
                                device=device, dtype=torch.int32)
         is_flush = torch.ones(batch, device=device, dtype=torch.bool)
     else:
-        write_pos = torch.full((batch,), max_cache_len // 2,
+        write_pos = torch.full((batch,), write_pos_value,
                                device=device, dtype=torch.int32)
         is_flush = torch.zeros(batch, device=device, dtype=torch.bool)
 
@@ -118,7 +133,8 @@ def main() -> None:
     torch.cuda.nvtx.range_pop()
 
     print(
-        f"mode={args.mode} iters={args.iters} batch={batch} "
+        f"mode={args.mode} write_pos={write_pos_value} iters={args.iters} "
+        f"batch={batch} "
         f"nheads={nheads} ngroups={ngroups} headdim={headdim} "
         f"dstate={dstate} buffer_len={max_cache_len}")
 
