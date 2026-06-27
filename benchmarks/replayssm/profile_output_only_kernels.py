@@ -38,6 +38,12 @@ def parse_args() -> argparse.Namespace:
         help="Allow mode/write_pos combinations that cannot occur in normal "
         "ReplaySSM decode scheduling, such as nonflush at buffer_len-1.",
     )
+    parser.add_argument(
+        "--cycle-nonflush",
+        action="store_true",
+        help="For nonflush mode, cycle write_pos through [0, buffer_len - 1) "
+        "inside the measured loop and report the average kernel time.",
+    )
     return parser.parse_args()
 
 
@@ -90,7 +96,12 @@ def main() -> None:
     bc_pre = torch.empty(batch, ngroups, max_cache_len,
                          device=device, dtype=torch.float32)
 
-    if args.write_pos is None:
+    if args.cycle_nonflush and args.mode != "nonflush":
+        raise ValueError("--cycle-nonflush is only valid with --mode nonflush")
+
+    if args.cycle_nonflush:
+        write_pos_value = 0
+    elif args.write_pos is None:
         write_pos_value = max_cache_len - 1 if args.mode == "flush" else max_cache_len // 2
     else:
         write_pos_value = args.write_pos
@@ -98,7 +109,7 @@ def main() -> None:
         raise ValueError(
             f"write_pos must be in [0, {max_cache_len}), got {write_pos_value}")
     natural_flush = write_pos_value == max_cache_len - 1
-    if not args.allow_artificial_state:
+    if not args.allow_artificial_state and not args.cycle_nonflush:
         if args.mode == "nonflush" and natural_flush:
             raise ValueError(
                 "nonflush with write_pos=buffer_len-1 is not a normal "
@@ -140,17 +151,28 @@ def main() -> None:
         )
 
     for _ in range(args.warmup):
-        run_once()
+        if args.cycle_nonflush:
+            for pos in range(max_cache_len - 1):
+                write_pos.fill_(pos)
+                run_once()
+        else:
+            run_once()
     torch.cuda.synchronize()
 
     torch.cuda.nvtx.range_push(f"replayssm_{args.mode}")
     for _ in range(args.iters):
+        if args.cycle_nonflush:
+            write_pos.fill_(_ % (max_cache_len - 1))
         run_once()
     torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()
 
+    pos_desc = (
+        f"cycle=0..{max_cache_len - 2}"
+        if args.cycle_nonflush else f"write_pos={write_pos_value}"
+    )
     print(
-        f"mode={args.mode} write_pos={write_pos_value} iters={args.iters} "
+        f"mode={args.mode} {pos_desc} iters={args.iters} "
         f"batch={batch} "
         f"nheads={nheads} ngroups={ngroups} headdim={headdim} "
         f"dstate={dstate} buffer_len={max_cache_len}")
