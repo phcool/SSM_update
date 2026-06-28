@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import pytest
 import torch
+import unittest
 
 from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_output_only import (  # noqa: E501
     selective_state_update_replayssm_output_only,
@@ -32,10 +32,9 @@ def _mx8_quant_dequant_ref(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     return torch.cat(blocks, dim=-1), torch.stack(scale_bits, dim=-1)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.skipif(
-    not hasattr(torch, "float8_e4m3fn"),
-    reason="torch.float8_e4m3fn is required",
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+@unittest.skipUnless(
+    hasattr(torch, "float8_e4m3fn"), "torch.float8_e4m3fn is required"
 )
 def test_replayssm_mx8_cache_uses_ocp_e4m3_and_e8m0_scales():
     torch.manual_seed(0)
@@ -142,3 +141,7 @@ def test_replayssm_mx8_cache_uses_ocp_e4m3_and_e8m0_scales():
     torch.testing.assert_close(B_scale_cache[:, :, 0, :], B_scale_ref)
     torch.testing.assert_close(x_dequant, x_ref, rtol=0, atol=0)
     torch.testing.assert_close(B_dequant, B_ref, rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    test_replayssm_mx8_cache_uses_ocp_e4m3_and_e8m0_scales()
