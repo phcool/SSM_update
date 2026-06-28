@@ -201,6 +201,7 @@ def _replayssm_output_only_precompute_kernel(
     MAX_CACHE_LEN: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     QUANT_MODE: tl.constexpr,
+    BLOCK_SIZE_B_SCALE: tl.constexpr,
     # heuristic-computed
     BLOCK_SIZE_DSTATE: tl.constexpr,
     HAS_STATE_BATCH_INDICES: tl.constexpr,
@@ -271,6 +272,32 @@ def _replayssm_output_only_precompute_kernel(
         B_cache = B_cache.to(tl.float32) * _e8m0_decode(B_scale)
     B_all = tl.where(offs_k[:, None] == write_pos, B_cur[None, :], B_cache)
     bc = tl.sum(B_all.to(tl.float32) * C[None, :].to(tl.float32), axis=1)
+
+    if QUANT_MODE == 1:
+        B_abs = tl.abs(B_cur.to(tl.float32))
+        B_block = offs_n // 32
+        B_scale = tl.full((BLOCK_SIZE_DSTATE,), 1.0, tl.float32)
+        for scale_idx in tl.static_range(0, BLOCK_SIZE_B_SCALE):
+            block_mask = (B_block == scale_idx) & (offs_n < dstate)
+            B_amax = tl.max(tl.where(block_mask, B_abs, 0.0), axis=0)
+            B_scale_bits, B_scale_block = _e8m0_scale_from_amax(B_amax)
+            B_scale = tl.where(B_block == scale_idx, B_scale_block, B_scale)
+            tl.store(
+                B_scale_cache_ptr
+                + write_pos * stride_B_scale_cache_pos
+                + scale_idx * stride_B_scale_cache_block,
+                B_scale_bits,
+            )
+        B_q = tl.clamp(B_cur.to(tl.float32) / B_scale, -448.0, 448.0).to(
+            B_cache_ptr.dtype.element_ty
+        )
+        tl.store(
+            B_cache_ptr
+            + write_pos * stride_B_cache_pos
+            + offs_n * stride_B_cache_dstate,
+            B_q,
+            mask=offs_n < dstate,
+        )
 
     tl.store(
         bc_pre_ptr + offs_k * stride_bc_pre_pos,
@@ -494,32 +521,7 @@ def _replayssm_output_only_kernel(
             tl.store(x_cache_ptr + offs_m * stride_x_cache_dim + write_pos * stride_x_cache_pos, x_cur, mask=offs_m < dim)
         if pid_m == 0:
             tl.store(dt_cache_ptr + write_pos * stride_dt_cache_pos, dt_cur)
-            if QUANT_MODE == 1:
-                B_abs = tl.abs(B_cur.to(tl.float32))
-                B_block = offs_n // 32
-                B_scale = tl.full((BLOCK_SIZE_DSTATE,), 1.0, tl.float32)
-                for scale_idx in tl.static_range(0, BLOCK_SIZE_B_SCALE):
-                    block_mask = (B_block == scale_idx) & (offs_n < dstate)
-                    B_amax = tl.max(tl.where(block_mask, B_abs, 0.0), axis=0)
-                    B_scale_bits, B_scale_block = _e8m0_scale_from_amax(B_amax)
-                    B_scale = tl.where(B_block == scale_idx, B_scale_block, B_scale)
-                    tl.store(
-                        B_scale_cache_ptr
-                        + write_pos * stride_B_scale_cache_pos
-                        + scale_idx * stride_B_scale_cache_block,
-                        B_scale_bits,
-                    )
-                B_q = tl.clamp(B_cur.to(tl.float32) / B_scale, -448.0, 448.0).to(
-                    B_cache_ptr.dtype.element_ty
-                )
-                tl.store(
-                    B_cache_ptr
-                    + write_pos * stride_B_cache_pos
-                    + offs_n * stride_B_cache_dstate,
-                    B_q,
-                    mask=offs_n < dstate,
-                )
-            else:
+            if QUANT_MODE == 0:
                 tl.store(B_cache_ptr + write_pos * stride_B_cache_pos + offs_n * stride_B_cache_dstate, B_cur, mask=offs_n < dstate)
     else:
         # Flush step: state route. Reconstruct the state from cached inputs,
@@ -760,6 +762,7 @@ def selective_state_update_replayssm_output_only(
             max_cache_len,
             block_size_k_cache,
             quant_mode_id,
+            block_size_b_scale,
             num_warps=2,
         )
         _replayssm_output_only_kernel[grid](
