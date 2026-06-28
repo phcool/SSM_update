@@ -25,7 +25,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--headdim", type=int, default=64)
     parser.add_argument("--dstate", type=int, default=128)
     parser.add_argument("--buffer-len", type=int, default=8)
-    parser.add_argument("--quant-mode", choices=("none", "mx8"), default="none")
+    parser.add_argument("--quant-mode", choices=("none", "mx8", "mx8_b_only"),
+                        default="none")
     parser.add_argument(
         "--write-pos",
         type=int,
@@ -100,6 +101,19 @@ def main() -> None:
             device=device,
             dtype=torch.uint8,
         )
+        B_cache = torch.randn(batch, ngroups, max_cache_len, dstate,
+                              device=device,
+                              dtype=dtype).to(torch.float8_e4m3fn)
+        B_scale_cache = torch.full(
+            (batch, ngroups, max_cache_len, (dstate + 31) // 32),
+            127,
+            device=device,
+            dtype=torch.uint8,
+        )
+    elif args.quant_mode == "mx8_b_only":
+        x_cache = torch.randn(batch, nheads, max_cache_len, headdim,
+                              device=device, dtype=dtype)
+        x_scale_cache = None
         B_cache = torch.randn(batch, ngroups, max_cache_len, dstate,
                               device=device,
                               dtype=dtype).to(torch.float8_e4m3fn)
