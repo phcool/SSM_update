@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""WikiText forced-decode PPL runner for ReplaySSM MX8 experiments."""
+"""WikiText forced-decode PPL runner for ReplaySSM experiments."""
 
 from __future__ import annotations
 
@@ -21,9 +21,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", default="Salesforce/wikitext")
     parser.add_argument("--dataset-config", default="wikitext-2-raw-v1")
     parser.add_argument("--split", default="test")
-    parser.add_argument("--quant-mode", choices=("none", "b", "x", "bx"),
-                        default="none")
-    parser.add_argument("--mx8-block-size", type=int, default=32)
     parser.add_argument("--buffer-len", type=int, default=16)
     parser.add_argument("--max-model-len", type=int, default=2176)
     parser.add_argument("--prefix-len", type=int, default=2048)
@@ -119,8 +116,6 @@ def compute_ppl(
 
 def main() -> None:
     args = parse_args()
-    os.environ["REPLAYSSM_MX8_QUANT"] = args.quant_mode
-    os.environ["REPLAYSSM_MX8_BLOCK_SIZE"] = str(args.mx8_block_size)
     if args.outlier_profile_jsonl is not None:
         os.environ["REPLAYSSM_OUTLIER_PROFILE_JSONL"] = str(
             args.outlier_profile_jsonl)
@@ -173,8 +168,6 @@ def main() -> None:
         "dataset": args.dataset,
         "dataset_config": args.dataset_config,
         "split": args.split,
-        "quant_mode": args.quant_mode,
-        "mx8_block_size": args.mx8_block_size,
         "buffer_len": args.buffer_len,
         "max_model_len": max_model_len,
         "prefix_len": args.prefix_len,
