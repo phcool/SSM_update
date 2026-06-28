@@ -29,6 +29,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-seqs", type=int, default=64)
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    parser.add_argument("--replayssm-quant-mode",
+                        choices=["none", "mx8"],
+                        default="none")
     parser.add_argument("--outlier-profile-jsonl", type=Path, default=None)
     parser.add_argument("--outlier-profile-stride", type=int, default=1)
     parser.add_argument("--output-json", type=Path, default=None)
@@ -159,6 +162,7 @@ def main() -> None:
         use_replayssm=True,
         replayssm_buffer_len=args.buffer_len,
         replayssm_route="output_only",
+        replayssm_quant_mode=args.replayssm_quant_mode,
     )
 
     max_model_len = llm.llm_engine.model_config.max_model_len
@@ -169,6 +173,7 @@ def main() -> None:
         "dataset_config": args.dataset_config,
         "split": args.split,
         "buffer_len": args.buffer_len,
+        "replayssm_quant_mode": args.replayssm_quant_mode,
         "max_model_len": max_model_len,
         "prefix_len": args.prefix_len,
         "decode_len": args.decode_len,
