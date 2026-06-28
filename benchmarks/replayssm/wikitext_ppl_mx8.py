@@ -32,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-num-seqs", type=int, default=64)
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    parser.add_argument("--outlier-profile-jsonl", type=Path, default=None)
+    parser.add_argument("--outlier-profile-stride", type=int, default=1)
     parser.add_argument("--output-json", type=Path, default=None)
     return parser.parse_args()
 
@@ -119,6 +121,11 @@ def main() -> None:
     args = parse_args()
     os.environ["REPLAYSSM_MX8_QUANT"] = args.quant_mode
     os.environ["REPLAYSSM_MX8_BLOCK_SIZE"] = str(args.mx8_block_size)
+    if args.outlier_profile_jsonl is not None:
+        os.environ["REPLAYSSM_OUTLIER_PROFILE_JSONL"] = str(
+            args.outlier_profile_jsonl)
+        os.environ["REPLAYSSM_OUTLIER_PROFILE_STRIDE"] = str(
+            args.outlier_profile_stride)
     if args.prefix_len + args.decode_len > args.max_model_len:
         raise ValueError(
             f"prefix_len + decode_len must be <= max_model_len; got "
@@ -170,6 +177,10 @@ def main() -> None:
         "decode_len": args.decode_len,
         "num_samples": args.num_samples,
         "max_num_seqs": args.max_num_seqs,
+        "outlier_profile_jsonl": (str(args.outlier_profile_jsonl)
+                                  if args.outlier_profile_jsonl is not None
+                                  else None),
+        "outlier_profile_stride": args.outlier_profile_stride,
         "windows": len(windows),
         "tokens": n_tokens,
         "nll_sum": nll_sum,

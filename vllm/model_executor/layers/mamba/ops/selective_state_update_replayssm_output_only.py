@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # ruff: noqa: E501
 
+import json
 import os
+import time
 
 import torch
 
@@ -12,6 +14,9 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 
 _MX8_FP8_MAX = 448.0
+_OUTLIER_PROFILE_CALL = 0
+_OUTLIER_PROFILE_FILE = None
+_OUTLIER_PROFILE_PATH = None
 
 
 def _get_replayssm_mx8_quant_mode() -> str:
@@ -30,6 +35,112 @@ def _get_replayssm_mx8_block_size() -> int:
     if block_size <= 0:
         raise ValueError("REPLAYSSM_MX8_BLOCK_SIZE must be positive")
     return block_size
+
+
+def _get_replayssm_outlier_profile_stride() -> int:
+    stride = int(os.getenv("REPLAYSSM_OUTLIER_PROFILE_STRIDE", "1"))
+    if stride <= 0:
+        raise ValueError("REPLAYSSM_OUTLIER_PROFILE_STRIDE must be positive")
+    return stride
+
+
+def _get_replayssm_outlier_profile_file():
+    global _OUTLIER_PROFILE_FILE, _OUTLIER_PROFILE_PATH
+    path = os.getenv("REPLAYSSM_OUTLIER_PROFILE_JSONL", "").strip()
+    if not path:
+        return None
+    if _OUTLIER_PROFILE_FILE is None or _OUTLIER_PROFILE_PATH != path:
+        if _OUTLIER_PROFILE_FILE is not None:
+            _OUTLIER_PROFILE_FILE.close()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        _OUTLIER_PROFILE_FILE = open(path, "a", buffering=1)
+        _OUTLIER_PROFILE_PATH = path
+    return _OUTLIER_PROFILE_FILE
+
+
+def _summarize_outlier_tensor(tensor: torch.Tensor) -> dict[str, float | int | list[float]]:
+    values = tensor.detach().to(torch.float32).abs().reshape(-1)
+    n = values.numel()
+    if n == 0:
+        return {"numel": 0}
+
+    quantiles = torch.quantile(
+        values,
+        torch.tensor([0.5, 0.9, 0.99, 0.999, 0.9999], device=values.device),
+    )
+    amax = torch.max(values)
+    rms = torch.sqrt(torch.mean(values * values))
+    mean_abs = torch.mean(values)
+    topk = torch.topk(values, k=min(8, n)).values
+    eps = torch.finfo(torch.float32).tiny
+    return {
+        "numel": n,
+        "mean_abs": float(mean_abs.item()),
+        "rms": float(rms.item()),
+        "p50": float(quantiles[0].item()),
+        "p90": float(quantiles[1].item()),
+        "p99": float(quantiles[2].item()),
+        "p999": float(quantiles[3].item()),
+        "p9999": float(quantiles[4].item()),
+        "amax": float(amax.item()),
+        "amax_over_rms": float((amax / torch.clamp(rms, min=eps)).item()),
+        "amax_over_p999": float(
+            (amax / torch.clamp(quantiles[3], min=eps)).item()),
+        "count_gt_6rms": int(torch.sum(values > 6.0 * rms).item()),
+        "count_gt_8rms": int(torch.sum(values > 8.0 * rms).item()),
+        "count_gt_10rms": int(torch.sum(values > 10.0 * rms).item()),
+        "top_abs": [float(v) for v in topk.cpu().tolist()],
+    }
+
+
+def _profile_replayssm_cache_slots(
+    x_cache: torch.Tensor,
+    B_cache: torch.Tensor,
+    write_pos: torch.Tensor,
+    is_flush: torch.Tensor,
+    batch: int,
+    state_batch_indices: torch.Tensor | None,
+    null_block_id: int,
+) -> None:
+    profile_file = _get_replayssm_outlier_profile_file()
+    if profile_file is None:
+        return
+
+    global _OUTLIER_PROFILE_CALL
+    _OUTLIER_PROFILE_CALL += 1
+    stride = _get_replayssm_outlier_profile_stride()
+    if (_OUTLIER_PROFILE_CALL - 1) % stride != 0:
+        return
+
+    if state_batch_indices is None:
+        state_indices = torch.arange(batch, device=write_pos.device)
+    else:
+        state_indices = state_batch_indices[:batch, 0]
+        state_indices = state_indices.to(device=write_pos.device)
+
+    positions = write_pos[:batch]
+    valid = (state_indices != null_block_id) & ~is_flush[:batch].bool()
+    if not torch.any(valid):
+        return
+
+    state_indices = state_indices[valid].long()
+    positions = positions[valid].long()
+    x_slots = x_cache[state_indices, :, positions, :]
+    B_slots = B_cache[state_indices, :, positions, :]
+    pos_cpu = positions.detach().cpu()
+    pos_hist = torch.bincount(pos_cpu, minlength=x_cache.shape[2]).tolist()
+    record = {
+        "call_index": _OUTLIER_PROFILE_CALL,
+        "time": time.time(),
+        "batch": batch,
+        "valid_rows": int(valid.sum().item()),
+        "write_pos_hist": pos_hist,
+        "x_shape": list(x_slots.shape),
+        "B_shape": list(B_slots.shape),
+        "x": _summarize_outlier_tensor(x_slots),
+        "B": _summarize_outlier_tensor(B_slots),
+    }
+    profile_file.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 def _mx8_fake_quant_dequant(x: torch.Tensor, block_size: int) -> torch.Tensor:
@@ -639,6 +750,15 @@ def selective_state_update_replayssm_output_only(
             num_warps=num_warps,
         )
 
+    _profile_replayssm_cache_slots(
+        x_cache,
+        B_cache,
+        write_pos,
+        is_flush,
+        batch,
+        state_batch_indices,
+        null_block_id,
+    )
     _fake_quantize_replayssm_cache_slots(
         x_cache,
         B_cache,
