@@ -117,15 +117,25 @@ class MambaStateDtypeCalculator:
                 torch.float32,
                 activation_dtype,
             )
-        if replayssm_quant_mode in ("mx8", "mx4"):
+        if replayssm_quant_mode == "mx8":
+            return (
+                conv_dtype,
+                ssm_dtype,
+                torch.float8_e4m3fn,
+                torch.uint8,
+                torch.float32,
+                torch.float8_e4m3fn,
+                torch.uint8,
+            )
+        if replayssm_quant_mode == "mx4":
             return (
                 conv_dtype,
                 ssm_dtype,
                 torch.uint8,
-                torch.float32,
-                torch.float32,
                 torch.uint8,
                 torch.float32,
+                torch.uint8,
+                torch.uint8,
             )
         raise ValueError(f"Unsupported ReplaySSM quant mode: {replayssm_quant_mode}")
 
@@ -361,8 +371,12 @@ class MambaStateShapeCalculator:
                 B_cache_shape,
             )
         if replayssm_quant_mode == "mx8":
-            x_scale_shape = (local_nheads, replayssm_buffer_len, _cdiv(head_dim, 16))
-            B_scale_shape = (local_ngroups, replayssm_buffer_len, 1)
+            x_scale_shape = (local_nheads, replayssm_buffer_len, _cdiv(head_dim, 32))
+            B_scale_shape = (
+                local_ngroups,
+                replayssm_buffer_len,
+                _cdiv(state_size, 32),
+            )
             return (
                 conv_state_shape,
                 temporal_state_shape,
