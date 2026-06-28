@@ -126,6 +126,10 @@ def main() -> None:
             args.outlier_profile_jsonl)
         os.environ["REPLAYSSM_OUTLIER_PROFILE_STRIDE"] = str(
             args.outlier_profile_stride)
+        os.environ["REPLAYSSM_XB_PROFILE_JSONL"] = str(
+            args.outlier_profile_jsonl)
+        os.environ["REPLAYSSM_XB_PROFILE_STRIDE"] = str(
+            args.outlier_profile_stride)
     if args.prefix_len + args.decode_len > args.max_model_len:
         raise ValueError(
             f"prefix_len + decode_len must be <= max_model_len; got "

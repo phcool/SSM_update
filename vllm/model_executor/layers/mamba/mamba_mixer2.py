@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import json
+import os
 import re
+import time
 
 import torch
 from torch import nn
@@ -67,6 +70,106 @@ from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 logger = init_logger(__name__)
+
+_REPLAYSSM_XB_PROFILE_CALL = 0
+_REPLAYSSM_XB_PROFILE_FILE = None
+_REPLAYSSM_XB_PROFILE_PATH = None
+
+
+def _get_replayssm_xb_profile_file():
+    global _REPLAYSSM_XB_PROFILE_FILE, _REPLAYSSM_XB_PROFILE_PATH
+    path = os.getenv("REPLAYSSM_XB_PROFILE_JSONL", "").strip()
+    if not path:
+        return None
+    if _REPLAYSSM_XB_PROFILE_FILE is None or _REPLAYSSM_XB_PROFILE_PATH != path:
+        if _REPLAYSSM_XB_PROFILE_FILE is not None:
+            _REPLAYSSM_XB_PROFILE_FILE.close()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        _REPLAYSSM_XB_PROFILE_FILE = open(path, "a", buffering=1)
+        _REPLAYSSM_XB_PROFILE_PATH = path
+    return _REPLAYSSM_XB_PROFILE_FILE
+
+
+def _get_replayssm_xb_profile_stride() -> int:
+    stride = int(os.getenv("REPLAYSSM_XB_PROFILE_STRIDE", "1"))
+    if stride <= 0:
+        raise ValueError("REPLAYSSM_XB_PROFILE_STRIDE must be positive")
+    return stride
+
+
+def _summarize_replayssm_xb_tensor(tensor: torch.Tensor) -> dict:
+    values = tensor.detach().to(torch.float32).abs().reshape(-1)
+    n = values.numel()
+    if n == 0:
+        return {"numel": 0}
+    quantiles = torch.quantile(
+        values,
+        torch.tensor([0.5, 0.9, 0.99, 0.999, 0.9999], device=values.device),
+    )
+    amax = torch.max(values)
+    rms = torch.sqrt(torch.mean(values * values))
+    eps = torch.finfo(torch.float32).tiny
+    topk = torch.topk(values, k=min(8, n)).values
+    return {
+        "numel": n,
+        "mean_abs": float(torch.mean(values).item()),
+        "rms": float(rms.item()),
+        "p50": float(quantiles[0].item()),
+        "p90": float(quantiles[1].item()),
+        "p99": float(quantiles[2].item()),
+        "p999": float(quantiles[3].item()),
+        "p9999": float(quantiles[4].item()),
+        "amax": float(amax.item()),
+        "amax_over_rms": float((amax / torch.clamp(rms, min=eps)).item()),
+        "amax_over_p999": float(
+            (amax / torch.clamp(quantiles[3], min=eps)).item()),
+        "count_gt_6rms": int(torch.sum(values > 6.0 * rms).item()),
+        "count_gt_8rms": int(torch.sum(values > 8.0 * rms).item()),
+        "count_gt_10rms": int(torch.sum(values > 10.0 * rms).item()),
+        "top_abs": [float(v) for v in topk.cpu().tolist()],
+    }
+
+
+def _profile_replayssm_xb_decode_inputs(
+    x: torch.Tensor,
+    B: torch.Tensor,
+    is_flush: torch.Tensor | None,
+    layer_id: int | None,
+    layer_name: str,
+) -> None:
+    profile_file = _get_replayssm_xb_profile_file()
+    if profile_file is None:
+        return
+
+    global _REPLAYSSM_XB_PROFILE_CALL
+    _REPLAYSSM_XB_PROFILE_CALL += 1
+    stride = _get_replayssm_xb_profile_stride()
+    if (_REPLAYSSM_XB_PROFILE_CALL - 1) % stride != 0:
+        return
+
+    if is_flush is not None:
+        valid = ~is_flush[: x.shape[0]].bool()
+        if not torch.any(valid):
+            return
+        x = x[valid]
+        B = B[valid]
+        valid_rows = int(valid.sum().item())
+    else:
+        valid_rows = x.shape[0]
+
+    record = {
+        "source": "mamba_mixer2_decode_input",
+        "call_index": _REPLAYSSM_XB_PROFILE_CALL,
+        "time": time.time(),
+        "layer_id": layer_id,
+        "layer_name": layer_name,
+        "valid_rows": valid_rows,
+        "x_shape": list(x.shape),
+        "B_shape": list(B.shape),
+        "x": _summarize_replayssm_xb_tensor(x),
+        "B": _summarize_replayssm_xb_tensor(B),
+    }
+    profile_file.write(json.dumps(record, sort_keys=True) + "\n")
 
 # Added by the IBM Team, 2024
 
@@ -1091,6 +1194,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
             C_d = C_d.view(-1, n_groups, C_d.shape[1] // n_groups)
             hidden_states_d = hidden_states_d.view(
                 -1, self.num_heads // self.tp_size, self.head_dim
+            )
+            _profile_replayssm_xb_decode_inputs(
+                hidden_states_d,
+                B_d,
+                attn_metadata.is_flush_d,
+                self.replayssm_profile_layer_id,
+                self.prefix,
             )
 
             assert preallocated_ssm_out_d is not None
