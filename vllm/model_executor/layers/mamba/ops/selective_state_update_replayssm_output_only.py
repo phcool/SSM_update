@@ -23,17 +23,21 @@ _E4M3_MAX = 448.0
 
 
 @triton.jit
-def _e8m0_scale_from_amax(amax):
-    scale_raw = amax * (1.0 / 448.0)
-    scale_exp = tl.ceil(tl.log2(tl.maximum(scale_raw, 5.877471754111438e-39)))
-    scale_bits = tl.clamp(scale_exp + 127.0, 0.0, 255.0).to(tl.uint8)
-    scale = tl.exp2(scale_bits.to(tl.float32) - 127.0)
-    return scale_bits, scale
+def _e8m0_bits_to_float(scale_bits):
+    return (scale_bits.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
 
 
 @triton.jit
 def _e8m0_decode(scale_bits):
-    return tl.exp2(scale_bits.to(tl.float32) - 127.0)
+    return _e8m0_bits_to_float(scale_bits)
+
+
+@triton.jit
+def _e8m0_scale_from_amax(amax):
+    scale_raw = amax * (1.0 / 448.0)
+    scale_exp = tl.ceil(tl.log2(tl.maximum(scale_raw, 5.877471754111438e-39)))
+    scale_bits = tl.clamp(scale_exp + 127.0, 0.0, 255.0).to(tl.uint8)
+    return scale_bits, _e8m0_bits_to_float(scale_bits)
 
 
 def _get_replayssm_outlier_profile_stride() -> int:
