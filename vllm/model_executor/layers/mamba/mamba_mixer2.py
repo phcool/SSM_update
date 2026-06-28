@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import re
+
 import torch
 from torch import nn
 
@@ -507,6 +509,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self.model_config = model_config
         self.cache_config = cache_config
         self.prefix = prefix
+        layer_match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", prefix)
+        self.replayssm_profile_layer_id = (
+            int(layer_match.group(1)) if layer_match is not None else None
+        )
         self.use_cache_kernel = (
             cache_config.use_replayssm if cache_config is not None else False
         )
@@ -1186,6 +1192,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
                         max_cache_len=self.max_cache_len,
                         state_batch_indices=state_indices_tensor_d_input,
                         out=preallocated_ssm_out_d,
+                        profile_layer_id=self.replayssm_profile_layer_id,
+                        profile_layer_name=self.prefix,
                     )
                 else:
                     selective_state_update_replayssm_state_and_output(

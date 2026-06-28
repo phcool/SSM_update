@@ -101,6 +101,8 @@ def _profile_replayssm_cache_slots(
     batch: int,
     state_batch_indices: torch.Tensor | None,
     null_block_id: int,
+    profile_layer_id: int | None,
+    profile_layer_name: str | None,
 ) -> None:
     profile_file = _get_replayssm_outlier_profile_file()
     if profile_file is None:
@@ -134,6 +136,8 @@ def _profile_replayssm_cache_slots(
         "time": time.time(),
         "batch": batch,
         "valid_rows": int(valid.sum().item()),
+        "layer_id": profile_layer_id,
+        "layer_name": profile_layer_name,
         "write_pos_hist": pos_hist,
         "x_shape": list(x_slots.shape),
         "B_shape": list(B_slots.shape),
@@ -563,6 +567,8 @@ def selective_state_update_replayssm_output_only(
     state_batch_indices: torch.Tensor | None = None,
     null_block_id: int = NULL_BLOCK_ID,
     out: torch.Tensor | None = None,
+    profile_layer_id: int | None = None,
+    profile_layer_name: str | None = None,
 ) -> torch.Tensor:
     """Cached-bc SSM update for vLLM's autoregressive Mamba2 decode path."""
     has_heads = state.dim() > 3
@@ -758,6 +764,8 @@ def selective_state_update_replayssm_output_only(
         batch,
         state_batch_indices,
         null_block_id,
+        profile_layer_id,
+        profile_layer_name,
     )
     _fake_quantize_replayssm_cache_slots(
         x_cache,
