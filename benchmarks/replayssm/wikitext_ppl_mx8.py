@@ -24,34 +24,38 @@ def parse_args() -> argparse.Namespace:
                         default="none")
     parser.add_argument("--mx8-block-size", type=int, default=32)
     parser.add_argument("--buffer-len", type=int, default=16)
-    parser.add_argument("--max-model-len", type=int, default=1024)
-    parser.add_argument("--prefix-len", type=int, default=512)
+    parser.add_argument("--max-model-len", type=int, default=2176)
+    parser.add_argument("--prefix-len", type=int, default=2048)
     parser.add_argument("--decode-len", type=int, default=128)
-    parser.add_argument("--max-num-seqs", type=int, default=16)
+    parser.add_argument("--num-samples", type=int, default=256)
+    parser.add_argument("--max-num-seqs", type=int, default=64)
     parser.add_argument("--dtype", default="bfloat16")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
-    parser.add_argument("--limit-tokens", type=int, default=None)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--output-json", type=Path, default=None)
     return parser.parse_args()
 
 
 def make_decode_windows(tokens: list[int], prefix_len: int, decode_len: int,
-                        limit_tokens: int | None) -> list[tuple[list[int],
-                                                                list[int]]]:
+                        num_samples: int) -> list[tuple[list[int],
+                                                        list[int]]]:
+    """Build fixed teacher-forcing samples.
+
+    Each sample pre-fills exactly ``prefix_len`` tokens and scores exactly
+    ``decode_len`` forced decode steps. Chunks are non-overlapping so the
+    requested sample count maps directly to the amount of evaluated data.
+    """
     windows: list[tuple[list[int], list[int]]] = []
-    scored = 0
-    for begin in range(0, len(tokens) - prefix_len - 1, decode_len):
-        target_end = min(begin + prefix_len + decode_len, len(tokens))
+    chunk_len = prefix_len + decode_len
+    for begin in range(0, len(tokens) - chunk_len + 1, chunk_len):
         prompt = tokens[begin:begin + prefix_len]
-        target = tokens[begin + prefix_len:target_end]
-        if not prompt or not target:
-            continue
-        if limit_tokens is not None and scored + len(target) > limit_tokens:
-            target = target[:limit_tokens - scored]
+        target = tokens[begin + prefix_len:begin + chunk_len]
         windows.append((prompt, target))
-        scored += len(target)
-        if limit_tokens is not None and scored >= limit_tokens:
+        if len(windows) >= num_samples:
             break
+    if len(windows) < num_samples:
+        raise ValueError(
+            f"dataset only provided {len(windows)} samples of {chunk_len} "
+            f"tokens, but --num-samples requested {num_samples}")
     return windows
 
 
@@ -140,7 +144,7 @@ def main() -> None:
             f"prefix_len + decode_len must be <= max_model_len; got "
             f"{args.prefix_len} + {args.decode_len} > {max_model_len}")
     windows = make_decode_windows(tokens, args.prefix_len, args.decode_len,
-                                  args.limit_tokens)
+                                  args.num_samples)
 
     ppl, n_tokens, nll_sum = compute_ppl(llm, windows)
     result = {
@@ -154,6 +158,7 @@ def main() -> None:
         "max_model_len": max_model_len,
         "prefix_len": args.prefix_len,
         "decode_len": args.decode_len,
+        "num_samples": args.num_samples,
         "max_num_seqs": args.max_num_seqs,
         "windows": len(windows),
         "tokens": n_tokens,
