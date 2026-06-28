@@ -35,6 +35,7 @@ CacheDType = Literal[
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
 ReplaySSMRoute = Literal["state_and_output", "output_only"]
+ReplaySSMQuantMode = Literal["none", "mx8", "mx4"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
@@ -154,6 +155,11 @@ class CacheConfig:
        per-step state (the state is only built on flush steps).
     - "state_and_output": outer-product route. Reconstructs the full SSM state
        every step via tl.dot, then reads the output from it."""
+    replayssm_quant_mode: ReplaySSMQuantMode = "none"
+    """ReplaySSM ring-buffer quantization mode.
+    - "none": keep the recent x/B buffers in activation dtype.
+    - "mx8": allocate quantized x/B buffers plus scale buffers.
+    - "mx4": reserved for packed 4-bit x/B buffers plus scale buffers."""
     use_replayssm_spec: bool = False
     """Use the ReplaySSM speculative-decode Mamba2 kernel (circular post-conv
     cache + early-flush). Requires speculative decoding and

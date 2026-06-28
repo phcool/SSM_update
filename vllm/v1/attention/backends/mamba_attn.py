@@ -194,15 +194,23 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 vllm_config.cache_config.replayssm_route
             )
             if self.cached_kernel_variant == "output_only":
-                # B_cache shape = (ngroups, max_cache_len, dstate). Index in
-                # MambaSpec.shapes is (conv_state, ssm_state, x_cache,
-                # dt_cache, B_cache) when the cached kernel is enabled.
-                if len(kv_cache_spec.shapes) < 5:
+                quant_mode = vllm_config.cache_config.replayssm_quant_mode
+                # B_cache shape = (ngroups, max_cache_len, dstate). In
+                # unquantized mode the page is (conv, ssm, x, dt, B); in
+                # quantized mode it is (conv, ssm, x_q, x_scale, dt, B_q,
+                # B_scale).
+                if quant_mode == "none":
+                    b_cache_shape_idx = 4
+                    expected_tensors = 5
+                else:
+                    b_cache_shape_idx = 5
+                    expected_tensors = 7
+                if len(kv_cache_spec.shapes) < expected_tensors:
                     raise ValueError(
-                        "output-only variant requires the 5-tensor Mamba2 "
-                        "page (conv, ssm, x_cache, dt_cache, B_cache)"
+                        "output-only variant requires the configured "
+                        "ReplaySSM Mamba2 page layout"
                     )
-                bc_ngroups = kv_cache_spec.shapes[4][0]
+                bc_ngroups = kv_cache_spec.shapes[b_cache_shape_idx][0]
                 # This is a per-step scratch consumed by the output-only
                 # ReplaySSM decode kernel. It must cover eager/no-cudagraph
                 # decode too, where decode_cudagraph_max_bs can be 0.

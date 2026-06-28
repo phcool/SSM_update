@@ -9,13 +9,15 @@ import time
 import torch
 
 from vllm.model_executor.layers.mamba.ops.mamba_ssm import softplus
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, tldevice, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 
 _OUTLIER_PROFILE_CALL = 0
 _OUTLIER_PROFILE_FILE = None
 _OUTLIER_PROFILE_PATH = None
+_REPLAYSSM_QUANT_NONE = 0
+_REPLAYSSM_QUANT_MX8 = 1
 
 
 def _get_replayssm_outlier_profile_stride() -> int:
@@ -88,6 +90,8 @@ def _profile_replayssm_cache_slots(
     profile_file = _get_replayssm_outlier_profile_file()
     if profile_file is None:
         return
+    if not (x_cache.is_floating_point() and B_cache.is_floating_point()):
+        return
 
     global _OUTLIER_PROFILE_CALL
     _OUTLIER_PROFILE_CALL += 1
@@ -142,6 +146,7 @@ def _replayssm_output_only_precompute_kernel(
     B_ptr,
     C_ptr,
     B_cache_ptr,
+    B_scale_cache_ptr,
     write_pos_ptr,
     is_flush_ptr,
     bc_pre_ptr,
@@ -163,6 +168,9 @@ def _replayssm_output_only_precompute_kernel(
     stride_B_cache_group,
     stride_B_cache_pos,
     stride_B_cache_dstate,
+    stride_B_scale_cache_batch,
+    stride_B_scale_cache_group,
+    stride_B_scale_cache_pos,
     stride_bc_pre_batch,
     stride_bc_pre_group,
     stride_bc_pre_pos,
@@ -171,6 +179,7 @@ def _replayssm_output_only_precompute_kernel(
     # Meta-parameters
     MAX_CACHE_LEN: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    QUANT_MODE: tl.constexpr,
     # heuristic-computed
     BLOCK_SIZE_DSTATE: tl.constexpr,
     HAS_STATE_BATCH_INDICES: tl.constexpr,
@@ -204,6 +213,10 @@ def _replayssm_output_only_precompute_kernel(
     B_cache_ptr += (
         state_batch_idx * stride_B_cache_batch + pid_g * stride_B_cache_group
     )
+    B_scale_cache_ptr += (
+        state_batch_idx * stride_B_scale_cache_batch
+        + pid_g * stride_B_scale_cache_group
+    )
     bc_pre_ptr += pid_b * stride_bc_pre_batch + pid_g * stride_bc_pre_group
 
     B_cur = tl.load(
@@ -226,6 +239,13 @@ def _replayssm_output_only_precompute_kernel(
         mask=(offs_k[:, None] < write_pos) & (offs_n[None, :] < dstate),
         other=0.0,
     )
+    if QUANT_MODE == 1:
+        B_scale = tl.load(
+            B_scale_cache_ptr + offs_k * stride_B_scale_cache_pos,
+            mask=offs_k < write_pos,
+            other=0.0,
+        ).to(tl.float32)
+        B_cache = (B_cache.to(tl.float32) - 128.0) * B_scale[:, None]
     B_all = tl.where(offs_k[:, None] == write_pos, B_cur[None, :], B_cache)
     bc = tl.sum(B_all.to(tl.float32) * C[None, :].to(tl.float32), axis=1)
 
@@ -262,8 +282,10 @@ def _replayssm_output_only_kernel(
     z_ptr,
     out_ptr,
     x_cache_ptr,
+    x_scale_cache_ptr,
     dt_cache_ptr,
     B_cache_ptr,
+    B_scale_cache_ptr,
     bc_pre_ptr,
     write_pos_ptr,
     is_flush_ptr,
@@ -307,6 +329,10 @@ def _replayssm_output_only_kernel(
     stride_x_cache_head,
     stride_x_cache_dim,
     stride_x_cache_pos,
+    stride_x_scale_cache_batch,
+    stride_x_scale_cache_head,
+    stride_x_scale_cache_pos,
+    stride_x_scale_cache_block,
     stride_dt_cache_batch,
     stride_dt_cache_head,
     stride_dt_cache_pos,
@@ -314,6 +340,9 @@ def _replayssm_output_only_kernel(
     stride_B_cache_group,
     stride_B_cache_pos,
     stride_B_cache_dstate,
+    stride_B_scale_cache_batch,
+    stride_B_scale_cache_group,
+    stride_B_scale_cache_pos,
     stride_bc_pre_batch,
     stride_bc_pre_group,
     stride_bc_pre_pos,
@@ -325,6 +354,7 @@ def _replayssm_output_only_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K_CACHE: tl.constexpr,
     BLOCK_SIZE_K_DOT: tl.constexpr,
+    QUANT_MODE: tl.constexpr,
     # heuristic-computed
     BLOCK_SIZE_DSTATE: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
@@ -359,8 +389,10 @@ def _replayssm_output_only_kernel(
     C_ptr += pid_b * stride_C_batch + (pid_h // nheads_ngroups_ratio) * stride_C_group
     out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
     x_cache_ptr += state_batch_idx * stride_x_cache_batch + pid_h * stride_x_cache_head
+    x_scale_cache_ptr += state_batch_idx * stride_x_scale_cache_batch + pid_h * stride_x_scale_cache_head
     dt_cache_ptr += state_batch_idx * stride_dt_cache_batch + pid_h * stride_dt_cache_head
     B_cache_ptr += state_batch_idx * stride_B_cache_batch + (pid_h // nheads_ngroups_ratio) * stride_B_cache_group
+    B_scale_cache_ptr += state_batch_idx * stride_B_scale_cache_batch + (pid_h // nheads_ngroups_ratio) * stride_B_scale_cache_group
     bc_pre_ptr += pid_b * stride_bc_pre_batch + (pid_h // nheads_ngroups_ratio) * stride_bc_pre_group
 
     # Current-token dt (+ bias, softplus), scalar A, current x / C, checkpoint
@@ -395,6 +427,15 @@ def _replayssm_output_only_kernel(
         # Gather buffered x over the window (history + current token).
         x_all_cache_ptrs = x_cache_ptr + offs_m[:, None] * stride_x_cache_dim + offs_k_cache[None, :] * stride_x_cache_pos
         x_all_cache = tl.load(x_all_cache_ptrs, mask=(offs_m[:, None] < dim) & (offs_k_cache[None, :] < write_pos), other=0.0)
+        if QUANT_MODE == 1:
+            x_scale_cache = tl.load(
+                x_scale_cache_ptr
+                + offs_k_cache * stride_x_scale_cache_pos
+                + pid_m * stride_x_scale_cache_block,
+                mask=offs_k_cache < write_pos,
+                other=0.0,
+            ).to(tl.float32)
+            x_all_cache = (x_all_cache.to(tl.float32) - 128.0) * x_scale_cache[None, :]
         x_all_cache = tl.where(offs_k_cache[None, :] == write_pos, x_cur[:, None], x_all_cache)
 
         # Decayed checkpoint readout plus the weighted sum of cached values.
@@ -404,10 +445,46 @@ def _replayssm_output_only_kernel(
         out = checkpoint_out + cache_out
 
         # Append the current token (x, dt, B) into the buffer at write_pos.
-        tl.store(x_cache_ptr + offs_m * stride_x_cache_dim + write_pos * stride_x_cache_pos, x_cur, mask=offs_m < dim)
+        if QUANT_MODE == 1:
+            x_abs = tl.abs(x_cur.to(tl.float32))
+            x_amax = tl.max(tl.where(offs_m < dim, x_abs, 0.0), axis=0)
+            x_scale = tl.maximum(x_amax / 127.0, 1.0e-12)
+            x_q = tl.clamp(tldevice.round(x_cur.to(tl.float32) / x_scale), -127.0, 127.0) + 128.0
+            tl.store(
+                x_cache_ptr
+                + offs_m * stride_x_cache_dim
+                + write_pos * stride_x_cache_pos,
+                x_q,
+                mask=offs_m < dim,
+            )
+            tl.store(
+                x_scale_cache_ptr
+                + write_pos * stride_x_scale_cache_pos
+                + pid_m * stride_x_scale_cache_block,
+                x_scale,
+            )
+        else:
+            tl.store(x_cache_ptr + offs_m * stride_x_cache_dim + write_pos * stride_x_cache_pos, x_cur, mask=offs_m < dim)
         if pid_m == 0:
             tl.store(dt_cache_ptr + write_pos * stride_dt_cache_pos, dt_cur)
-            tl.store(B_cache_ptr + write_pos * stride_B_cache_pos + offs_n * stride_B_cache_dstate, B_cur, mask=offs_n < dstate)
+            if QUANT_MODE == 1:
+                B_abs = tl.abs(B_cur.to(tl.float32))
+                B_amax = tl.max(tl.where(offs_n < dstate, B_abs, 0.0), axis=0)
+                B_scale = tl.maximum(B_amax / 127.0, 1.0e-12)
+                B_q = tl.clamp(tldevice.round(B_cur.to(tl.float32) / B_scale), -127.0, 127.0) + 128.0
+                tl.store(
+                    B_cache_ptr
+                    + write_pos * stride_B_cache_pos
+                    + offs_n * stride_B_cache_dstate,
+                    B_q,
+                    mask=offs_n < dstate,
+                )
+                tl.store(
+                    B_scale_cache_ptr + write_pos * stride_B_scale_cache_pos,
+                    B_scale,
+                )
+            else:
+                tl.store(B_cache_ptr + write_pos * stride_B_cache_pos + offs_n * stride_B_cache_dstate, B_cur, mask=offs_n < dstate)
     else:
         # Flush step: state route. Reconstruct the state from cached inputs,
         # S_t = total_decay * S_0 + sum_j s_j (v_j k_j^T), persist it as the new
@@ -424,9 +501,25 @@ def _replayssm_output_only_kernel(
         # Gather buffered x and B over the window (history + current token).
         x_all_dot_ptrs = x_cache_ptr + offs_m[:, None] * stride_x_cache_dim + offs_k_dot[None, :] * stride_x_cache_pos
         x_all_dot = tl.load(x_all_dot_ptrs, mask=(offs_m[:, None] < dim) & (offs_k_dot[None, :] < write_pos), other=0.0)
+        if QUANT_MODE == 1:
+            x_scale_dot = tl.load(
+                x_scale_cache_ptr
+                + offs_k_dot * stride_x_scale_cache_pos
+                + pid_m * stride_x_scale_cache_block,
+                mask=offs_k_dot < write_pos,
+                other=0.0,
+            ).to(tl.float32)
+            x_all_dot = (x_all_dot.to(tl.float32) - 128.0) * x_scale_dot[None, :]
         x_all_dot = tl.where(offs_k_dot[None, :] == write_pos, x_cur[:, None], x_all_dot)
         B_all_dot_ptrs = B_cache_ptr + offs_k_dot[:, None] * stride_B_cache_pos + offs_n[None, :] * stride_B_cache_dstate
         B_all_dot = tl.load(B_all_dot_ptrs, mask=(offs_k_dot[:, None] < write_pos) & (offs_n[None, :] < dstate), other=0.0)
+        if QUANT_MODE == 1:
+            B_scale_dot = tl.load(
+                B_scale_cache_ptr + offs_k_dot * stride_B_scale_cache_pos,
+                mask=offs_k_dot < write_pos,
+                other=0.0,
+            ).to(tl.float32)
+            B_all_dot = (B_all_dot.to(tl.float32) - 128.0) * B_scale_dot[:, None]
         B_all_dot = tl.where(offs_k_dot[:, None] == write_pos, B_cur[None, :], B_all_dot)
 
         # Reconstruct the state from cached inputs and store it as the checkpoint.
@@ -470,8 +563,10 @@ def selective_state_update_replayssm_output_only(
     z: torch.Tensor | None = None,
     dt_softplus: bool = False,
     x_cache: torch.Tensor | None = None,
+    x_scale_cache: torch.Tensor | None = None,
     dt_cache: torch.Tensor | None = None,
     B_cache: torch.Tensor | None = None,
+    B_scale_cache: torch.Tensor | None = None,
     bc_pre: torch.Tensor | None = None,
     write_pos: torch.Tensor | None = None,
     is_flush: torch.Tensor | None = None,
@@ -479,6 +574,7 @@ def selective_state_update_replayssm_output_only(
     state_batch_indices: torch.Tensor | None = None,
     null_block_id: int = NULL_BLOCK_ID,
     out: torch.Tensor | None = None,
+    quant_mode: str = "none",
     profile_layer_id: int | None = None,
     profile_layer_name: str | None = None,
 ) -> torch.Tensor:
@@ -536,9 +632,30 @@ def selective_state_update_replayssm_output_only(
     assert x_cache is not None
     assert dt_cache is not None
     assert B_cache is not None
+    quant_mode_id = {
+        "none": _REPLAYSSM_QUANT_NONE,
+        "mx8": _REPLAYSSM_QUANT_MX8,
+    }.get(quant_mode)
+    if quant_mode_id is None:
+        raise NotImplementedError(f"ReplaySSM quant mode {quant_mode!r} is not implemented")
+    block_size_k_cache = max(1, triton.next_power_of_2(max_cache_len))
+    block_size_k_dot = max(16, block_size_k_cache)
+    block_size_m, num_warps = _get_replayssm_output_only_launch_config(dstate)
     assert x_cache.shape[1:] == (nheads, max_cache_len, dim)
     assert dt_cache.shape[1:] == (nheads, max_cache_len)
     assert B_cache.shape[1:] == (ngroups, max_cache_len, dstate)
+    if quant_mode_id == _REPLAYSSM_QUANT_MX8:
+        assert x_cache.dtype == torch.uint8
+        assert B_cache.dtype == torch.uint8
+        assert x_scale_cache is not None
+        assert B_scale_cache is not None
+        assert x_scale_cache.shape[1] == nheads
+        assert x_scale_cache.shape[2] == max_cache_len
+        assert x_scale_cache.shape[3] >= triton.cdiv(dim, block_size_m)
+        assert B_scale_cache.shape[1:] == (ngroups, max_cache_len, 1)
+    else:
+        x_scale_cache = x_cache
+        B_scale_cache = B_cache
     assert write_pos is not None and write_pos.shape[0] >= batch
     assert write_pos.dtype == torch.int32
     assert is_flush is not None and is_flush.shape[0] >= batch
@@ -550,10 +667,6 @@ def selective_state_update_replayssm_output_only(
     if state_batch_indices is not None:
         assert state_batch_indices.shape[0] >= batch
         assert state_batch_indices.shape[1] >= 1
-
-    block_size_k_cache = max(1, triton.next_power_of_2(max_cache_len))
-    block_size_k_dot = max(16, block_size_k_cache)
-    block_size_m, num_warps = _get_replayssm_output_only_launch_config(dstate)
 
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
     z_strides = (z.stride(0), z.stride(1), z.stride(2)) if z is not None else (0, 0, 0)
@@ -568,6 +681,7 @@ def selective_state_update_replayssm_output_only(
             B,
             C,
             B_cache,
+            B_scale_cache,
             write_pos,
             is_flush,
             bc_pre,
@@ -586,6 +700,9 @@ def selective_state_update_replayssm_output_only(
             B_cache.stride(1),
             B_cache.stride(2),
             B_cache.stride(3),
+            B_scale_cache.stride(0),
+            B_scale_cache.stride(1),
+            B_scale_cache.stride(2),
             bc_pre.stride(0),
             bc_pre.stride(1),
             bc_pre.stride(2),
@@ -593,6 +710,7 @@ def selective_state_update_replayssm_output_only(
             state_indices_strides[1],
             max_cache_len,
             block_size_k_cache,
+            quant_mode_id,
             num_warps=2,
         )
         _replayssm_output_only_kernel[grid](
@@ -607,8 +725,10 @@ def selective_state_update_replayssm_output_only(
             z,
             out,
             x_cache,
+            x_scale_cache,
             dt_cache,
             B_cache,
+            B_scale_cache,
             bc_pre,
             write_pos,
             is_flush,
@@ -648,6 +768,10 @@ def selective_state_update_replayssm_output_only(
             x_cache.stride(1),
             x_cache.stride(3),
             x_cache.stride(2),
+            x_scale_cache.stride(0),
+            x_scale_cache.stride(1),
+            x_scale_cache.stride(2),
+            x_scale_cache.stride(3),
             dt_cache.stride(0),
             dt_cache.stride(1),
             dt_cache.stride(2),
@@ -655,6 +779,9 @@ def selective_state_update_replayssm_output_only(
             B_cache.stride(1),
             B_cache.stride(2),
             B_cache.stride(3),
+            B_scale_cache.stride(0),
+            B_scale_cache.stride(1),
+            B_scale_cache.stride(2),
             bc_pre.stride(0),
             bc_pre.stride(1),
             bc_pre.stride(2),
@@ -665,6 +792,7 @@ def selective_state_update_replayssm_output_only(
             block_size_m,
             block_size_k_cache,
             block_size_k_dot,
+            quant_mode_id,
             num_warps=num_warps,
         )
 

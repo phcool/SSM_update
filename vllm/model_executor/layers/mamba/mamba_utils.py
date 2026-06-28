@@ -9,7 +9,7 @@ from typing import Literal, TypeAlias
 import torch
 
 import vllm.envs as envs
-from vllm.config.cache import MambaDType
+from vllm.config.cache import MambaDType, ReplaySSMQuantMode
 from vllm.config.model import ModelDType
 from vllm.distributed import divide
 from vllm.logger import init_logger
@@ -21,6 +21,10 @@ from vllm.utils.torch_utils import (
 logger = init_logger(__name__)
 
 ConvStateLayoutType = Literal["SD", "DS"]
+
+
+def _cdiv(x: int, y: int) -> int:
+    return (x + y - 1) // y
 
 
 @functools.lru_cache
@@ -87,13 +91,16 @@ class MambaStateDtypeCalculator:
         mamba_cache_dtype: MambaDType,
         mamba_ssm_cache_dtype: MambaDType,
         use_replayssm: bool,
+        replayssm_quant_mode: ReplaySSMQuantMode = "none",
     ) -> tuple[torch.dtype, ...]:
         """Mamba2 state dtypes, extended for the state-and-output decode kernel.
 
         Returns the baseline ``(conv, ssm)`` dtypes when
         ``use_replayssm`` is ``False``; otherwise appends the
-        state-and-output ring-buffer dtypes ``(x_cache, dt_cache, B_cache)`` =
-        ``(activation, fp32, activation)``. Must stay in sync with
+        ReplaySSM ring-buffer dtypes. In unquantized mode this appends
+        ``(x_cache, dt_cache, B_cache)`` = ``(activation, fp32, activation)``.
+        Quantized modes allocate ``(x_q, x_scale, dt, B_q, B_scale)`` instead
+        of the activation-dtype x/B caches. Must stay in sync with
         ``MambaMixer2.get_state_dtype``.
         """
         conv_dtype, ssm_dtype = cls.mamba2_state_dtype(
@@ -102,7 +109,25 @@ class MambaStateDtypeCalculator:
         if not use_replayssm:
             return conv_dtype, ssm_dtype
         activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
-        return conv_dtype, ssm_dtype, activation_dtype, torch.float32, activation_dtype
+        if replayssm_quant_mode == "none":
+            return (
+                conv_dtype,
+                ssm_dtype,
+                activation_dtype,
+                torch.float32,
+                activation_dtype,
+            )
+        if replayssm_quant_mode in ("mx8", "mx4"):
+            return (
+                conv_dtype,
+                ssm_dtype,
+                torch.uint8,
+                torch.float32,
+                torch.float32,
+                torch.uint8,
+                torch.float32,
+            )
+        raise ValueError(f"Unsupported ReplaySSM quant mode: {replayssm_quant_mode}")
 
     @classmethod
     def mamba2_spec_cached_state_dtype(
@@ -296,13 +321,16 @@ class MambaStateShapeCalculator:
         conv_kernel: int,
         use_replayssm: bool,
         replayssm_buffer_len: int,
+        replayssm_quant_mode: ReplaySSMQuantMode = "none",
         num_spec: int = 0,
     ) -> tuple[tuple[int, ...], ...]:
         """Mamba2 state shapes, extended for the state-and-output decode kernel.
 
         Returns the baseline ``(conv, ssm)`` shapes when
         ``use_replayssm`` is ``False``; otherwise appends the
-        state-and-output ring-buffer shapes ``x_cache``/``dt_cache``/``B_cache``.
+        ReplaySSM ring-buffer shapes. Unquantized mode appends
+        ``x_cache``/``dt_cache``/``B_cache``; quantized modes append
+        ``x_q``/``x_scale``/``dt_cache``/``B_q``/``B_scale``.
         Group/head counts use the (un-extended) ``n_groups``/``num_heads``
         divided by ``tp_world_size``, matching ``MambaMixer2.get_state_shape``.
         """
@@ -324,13 +352,41 @@ class MambaStateShapeCalculator:
         x_cache_shape = (local_nheads, replayssm_buffer_len, head_dim)
         dt_cache_shape = (local_nheads, replayssm_buffer_len)
         B_cache_shape = (local_ngroups, replayssm_buffer_len, state_size)
-        return (
-            conv_state_shape,
-            temporal_state_shape,
-            x_cache_shape,
-            dt_cache_shape,
-            B_cache_shape,
-        )
+        if replayssm_quant_mode == "none":
+            return (
+                conv_state_shape,
+                temporal_state_shape,
+                x_cache_shape,
+                dt_cache_shape,
+                B_cache_shape,
+            )
+        if replayssm_quant_mode == "mx8":
+            x_scale_shape = (local_nheads, replayssm_buffer_len, _cdiv(head_dim, 16))
+            B_scale_shape = (local_ngroups, replayssm_buffer_len, 1)
+            return (
+                conv_state_shape,
+                temporal_state_shape,
+                x_cache_shape,
+                x_scale_shape,
+                dt_cache_shape,
+                B_cache_shape,
+                B_scale_shape,
+            )
+        if replayssm_quant_mode == "mx4":
+            x_q_shape = (local_nheads, replayssm_buffer_len, _cdiv(head_dim, 2))
+            x_scale_shape = (local_nheads, replayssm_buffer_len, _cdiv(head_dim, 16))
+            B_q_shape = (local_ngroups, replayssm_buffer_len, _cdiv(state_size, 2))
+            B_scale_shape = (local_ngroups, replayssm_buffer_len, 1)
+            return (
+                conv_state_shape,
+                temporal_state_shape,
+                x_q_shape,
+                x_scale_shape,
+                dt_cache_shape,
+                B_q_shape,
+                B_scale_shape,
+            )
+        raise ValueError(f"Unsupported ReplaySSM quant mode: {replayssm_quant_mode}")
 
     @classmethod
     def mamba2_spec_cached_state_shape(

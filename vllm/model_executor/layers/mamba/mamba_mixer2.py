@@ -627,6 +627,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
             if cache_config is not None
             else "state_and_output"
         )
+        self.replayssm_quant_mode = (
+            cache_config.replayssm_quant_mode if cache_config is not None else "none"
+        )
         self.use_cache_spec_kernel = (
             cache_config.use_replayssm_spec
             if cache_config is not None
@@ -639,13 +642,14 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 "Mamba2 cached decode kernel requires tensor-parallel heads "
                 "to divide evenly"
             )
-        # The tuple is (conv_state, ssm_state); with state-and-output/bc decode enabled
-        # (conv_state, ssm_state, x_cache, dt_cache, B_cache); with cached-spec
-        # (hybrid) enabled (conv_state, ssm_state, post_conv_cache, dt_cache).
+        # The tuple is (conv_state, ssm_state). ReplaySSM without quantization
+        # adds (x_cache, dt_cache, B_cache); quantized ReplaySSM instead adds
+        # (x_q_cache, x_scale_cache, dt_cache, B_q_cache, B_scale_cache).
+        # Cached-spec (hybrid) uses (post_conv_cache, dt_cache).
         if self.use_cache_spec_kernel:
             _n_state = 4
         elif self.use_cache_kernel:
-            _n_state = 5
+            _n_state = 5 if self.replayssm_quant_mode == "none" else 7
         else:
             _n_state = 2
         self.kv_cache = tuple(torch.tensor([]) for _ in range(_n_state))
@@ -853,6 +857,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
             )
             ssm_state = self.kv_cache[1]
             spec_post_conv_cache = spec_dt_cache = None
+            x_scale_cache = B_scale_cache = None
             if self.use_cache_spec_kernel:
                 if len(self.kv_cache) != 4:
                     raise ValueError(
@@ -862,12 +867,26 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 spec_post_conv_cache, spec_dt_cache = self.kv_cache[2:]
                 x_cache = dt_cache = B_cache = None
             elif self.use_cache_kernel:
-                if len(self.kv_cache) != 5:
-                    raise ValueError(
-                        "Mamba2 cached decode kernel requires five Mamba "
-                        "state tensors"
-                    )
-                x_cache, dt_cache, B_cache = self.kv_cache[2:]
+                if self.replayssm_quant_mode == "none":
+                    if len(self.kv_cache) != 5:
+                        raise ValueError(
+                            "Mamba2 cached decode kernel requires five Mamba "
+                            "state tensors"
+                        )
+                    x_cache, dt_cache, B_cache = self.kv_cache[2:]
+                else:
+                    if len(self.kv_cache) != 7:
+                        raise ValueError(
+                            "Quantized Mamba2 cached decode kernel requires "
+                            "seven Mamba state tensors"
+                        )
+                    (
+                        x_cache,
+                        x_scale_cache,
+                        dt_cache,
+                        B_cache,
+                        B_scale_cache,
+                    ) = self.kv_cache[2:]
             else:
                 x_cache = dt_cache = B_cache = None
             has_initial_states_p = attn_metadata.has_initial_states_p
@@ -1294,12 +1313,15 @@ class MambaMixer2(MambaBase, PluggableLayer):
                         dt_bias,
                         dt_softplus=True,
                         x_cache=x_cache,
+                        x_scale_cache=x_scale_cache,
                         dt_cache=dt_cache,
                         B_cache=B_cache,
+                        B_scale_cache=B_scale_cache,
                         bc_pre=attn_metadata.bc_pre_scratch,
                         write_pos=attn_metadata.write_pos_d,
                         is_flush=attn_metadata.is_flush_d,
                         max_cache_len=self.max_cache_len,
+                        quant_mode=self.replayssm_quant_mode,
                         state_batch_indices=state_indices_tensor_d_input,
                         out=preallocated_ssm_out_d,
                         profile_layer_id=self.replayssm_profile_layer_id,
@@ -1359,6 +1381,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
             self.cache_config.mamba_cache_dtype,
             self.cache_config.mamba_ssm_cache_dtype,
             use_replayssm=self.use_cache_kernel,
+            replayssm_quant_mode=self.replayssm_quant_mode,
         )
 
     def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
@@ -1386,6 +1409,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
             num_spec=self.num_spec,
             use_replayssm=self.use_cache_kernel,
             replayssm_buffer_len=self.max_cache_len,
+            replayssm_quant_mode=self.replayssm_quant_mode,
         )
 
     @property

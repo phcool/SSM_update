@@ -2133,7 +2133,24 @@ class VllmConfig:
                     "--replayssm-route is only meaningful when "
                     "--use-replayssm is enabled"
                 )
+            if self.cache_config.replayssm_quant_mode != "none":
+                raise ValueError(
+                    "--replayssm-quant-mode is only meaningful when "
+                    "--use-replayssm is enabled"
+                )
             return self
+        if self.cache_config.replayssm_quant_mode == "mx4":
+            raise ValueError(
+                "--replayssm-quant-mode mx4 is reserved but not implemented yet"
+            )
+        if (
+            self.cache_config.replayssm_quant_mode != "none"
+            and self.cache_config.replayssm_route != "output_only"
+        ):
+            raise ValueError(
+                "--replayssm-quant-mode currently requires "
+                "--replayssm-route output_only"
+            )
         if self.cache_config.mamba_cache_mode != "none":
             raise ValueError(
                 "--use-replayssm requires --mamba-cache-mode none"

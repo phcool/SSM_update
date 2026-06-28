@@ -69,6 +69,7 @@ from vllm.config.cache import (
     MambaCacheMode,
     MambaDType,
     PrefixCachingHashAlgo,
+    ReplaySSMQuantMode,
 )
 from vllm.config.device import Device
 from vllm.config.kernel import IrOpPriorityConfig, LinearBackend, MoEBackend
@@ -678,6 +679,7 @@ class EngineArgs:
     replayssm_buffer_len: int = CacheConfig.replayssm_buffer_len
     use_replayssm: bool = CacheConfig.use_replayssm
     replayssm_route: str = CacheConfig.replayssm_route
+    replayssm_quant_mode: ReplaySSMQuantMode = CacheConfig.replayssm_quant_mode
     use_replayssm_spec: bool = CacheConfig.use_replayssm_spec
 
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
@@ -1169,6 +1171,10 @@ class EngineArgs:
         cache_group.add_argument(
             "--replayssm-route",
             **cache_kwargs["replayssm_route"],
+        )
+        cache_group.add_argument(
+            "--replayssm-quant-mode",
+            **cache_kwargs["replayssm_quant_mode"],
         )
         cache_group.add_argument(
             "--use-replayssm-spec",
@@ -1789,6 +1795,7 @@ class EngineArgs:
             replayssm_buffer_len=self.replayssm_buffer_len,
             use_replayssm=self.use_replayssm,
             replayssm_route=self.replayssm_route,
+            replayssm_quant_mode=self.replayssm_quant_mode,
             use_replayssm_spec=self.use_replayssm_spec,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
