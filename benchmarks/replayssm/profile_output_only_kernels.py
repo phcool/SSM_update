@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--headdim", type=int, default=64)
     parser.add_argument("--dstate", type=int, default=128)
     parser.add_argument("--buffer-len", type=int, default=8)
+    parser.add_argument("--quant-mode", choices=("none", "mx8"), default="none")
     parser.add_argument(
         "--write-pos",
         type=int,
@@ -87,12 +88,34 @@ def main() -> None:
     dt_bias = tied_dt_bias(nheads, headdim, device)
     out = torch.empty_like(x)
 
-    x_cache = torch.randn(batch, nheads, max_cache_len, headdim,
-                          device=device, dtype=dtype)
     dt_cache = torch.randn(batch, nheads, max_cache_len,
                            device=device, dtype=torch.float32)
-    B_cache = torch.randn(batch, ngroups, max_cache_len, dstate,
-                          device=device, dtype=dtype)
+    if args.quant_mode == "mx8":
+        x_cache = torch.randn(batch, nheads, max_cache_len, headdim,
+                              device=device,
+                              dtype=dtype).to(torch.float8_e4m3fn)
+        x_scale_cache = torch.full(
+            (batch, nheads, max_cache_len, (headdim + 31) // 32),
+            127,
+            device=device,
+            dtype=torch.uint8,
+        )
+        B_cache = torch.randn(batch, ngroups, max_cache_len, dstate,
+                              device=device,
+                              dtype=dtype).to(torch.float8_e4m3fn)
+        B_scale_cache = torch.full(
+            (batch, ngroups, max_cache_len, (dstate + 31) // 32),
+            127,
+            device=device,
+            dtype=torch.uint8,
+        )
+    else:
+        x_cache = torch.randn(batch, nheads, max_cache_len, headdim,
+                              device=device, dtype=dtype)
+        x_scale_cache = None
+        B_cache = torch.randn(batch, ngroups, max_cache_len, dstate,
+                              device=device, dtype=dtype)
+        B_scale_cache = None
     bc_pre = torch.empty(batch, ngroups, max_cache_len,
                          device=device, dtype=torch.float32)
 
@@ -141,12 +164,15 @@ def main() -> None:
             dt_bias=dt_bias,
             dt_softplus=True,
             x_cache=x_cache,
+            x_scale_cache=x_scale_cache,
             dt_cache=dt_cache,
             B_cache=B_cache,
+            B_scale_cache=B_scale_cache,
             bc_pre=bc_pre,
             write_pos=write_pos,
             is_flush=is_flush,
             max_cache_len=max_cache_len,
+            quant_mode=args.quant_mode,
             out=out,
         )
 
@@ -173,6 +199,7 @@ def main() -> None:
     )
     print(
         f"mode={args.mode} {pos_desc} iters={args.iters} "
+        f"quant_mode={args.quant_mode} "
         f"batch={batch} "
         f"nheads={nheads} ngroups={ngroups} headdim={headdim} "
         f"dstate={dstate} buffer_len={max_cache_len}")
