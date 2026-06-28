@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 
 from datasets import load_dataset
+from transformers import AutoTokenizer
 
 from vllm import LLM, SamplingParams
 
@@ -41,21 +42,30 @@ def make_decode_windows(tokens: list[int], prefix_len: int, decode_len: int,
     """Build fixed teacher-forcing samples.
 
     Each sample pre-fills exactly ``prefix_len`` tokens and scores exactly
-    ``decode_len`` forced decode steps. Chunks are non-overlapping so the
-    requested sample count maps directly to the amount of evaluated data.
+    ``decode_len`` forced decode steps. Starts are spread uniformly over the
+    token stream so ``num_samples`` is exact even when WikiText is too small
+    for that many non-overlapping chunks.
     """
     windows: list[tuple[list[int], list[int]]] = []
     chunk_len = prefix_len + decode_len
-    for begin in range(0, len(tokens) - chunk_len + 1, chunk_len):
+    max_begin = len(tokens) - chunk_len
+    if max_begin < 0:
+        raise ValueError(
+            f"dataset only provided {len(tokens)} tokens, but one sample "
+            f"requires {chunk_len}")
+
+    if num_samples == 1:
+        starts = [0]
+    else:
+        starts = [
+            round(i * max_begin / (num_samples - 1))
+            for i in range(num_samples)
+        ]
+
+    for begin in starts:
         prompt = tokens[begin:begin + prefix_len]
         target = tokens[begin + prefix_len:begin + chunk_len]
         windows.append((prompt, target))
-        if len(windows) >= num_samples:
-            break
-    if len(windows) < num_samples:
-        raise ValueError(
-            f"dataset only provided {len(windows)} samples of {chunk_len} "
-            f"tokens, but --num-samples requested {num_samples}")
     return windows
 
 
@@ -109,8 +119,17 @@ def main() -> None:
     args = parse_args()
     os.environ["REPLAYSSM_MX8_QUANT"] = args.quant_mode
     os.environ["REPLAYSSM_MX8_BLOCK_SIZE"] = str(args.mx8_block_size)
+    if args.prefix_len + args.decode_len > args.max_model_len:
+        raise ValueError(
+            f"prefix_len + decode_len must be <= max_model_len; got "
+            f"{args.prefix_len} + {args.decode_len} > {args.max_model_len}")
 
     dataset = load_dataset(args.dataset, args.dataset_config, split=args.split)
+    tokenizer = AutoTokenizer.from_pretrained(args.model,
+                                              trust_remote_code=True)
+    tokens = tokenizer.encode("\n\n".join(dataset["text"]))
+    windows = make_decode_windows(tokens, args.prefix_len, args.decode_len,
+                                  args.num_samples)
 
     llm = LLM(
         model=args.model,
@@ -136,16 +155,7 @@ def main() -> None:
         replayssm_route="output_only",
     )
 
-    tokenizer = llm.get_tokenizer()
-    tokens = tokenizer.encode("\n\n".join(dataset["text"]))
     max_model_len = llm.llm_engine.model_config.max_model_len
-    if args.prefix_len + args.decode_len > max_model_len:
-        raise ValueError(
-            f"prefix_len + decode_len must be <= max_model_len; got "
-            f"{args.prefix_len} + {args.decode_len} > {max_model_len}")
-    windows = make_decode_windows(tokens, args.prefix_len, args.decode_len,
-                                  args.num_samples)
-
     ppl, n_tokens, nll_sum = compute_ppl(llm, windows)
     result = {
         "model": args.model,
