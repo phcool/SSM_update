@@ -18,7 +18,6 @@ _OUTLIER_PROFILE_FILE = None
 _OUTLIER_PROFILE_PATH = None
 _REPLAYSSM_QUANT_NONE = 0
 _REPLAYSSM_QUANT_MX8 = 1
-_REPLAYSSM_QUANT_MX8_B_ONLY = 2
 _OCP_MX_BLOCK_SIZE = 32
 _E4M3_MAX = 448.0
 
@@ -262,7 +261,7 @@ def _replayssm_output_only_precompute_kernel(
         mask=(offs_k[:, None] < write_pos) & (offs_n[None, :] < dstate),
         other=0.0,
     )
-    if QUANT_MODE != 0:
+    if QUANT_MODE == 1:
         B_scale = tl.load(
             B_scale_cache_ptr
             + offs_k[:, None] * stride_B_scale_cache_pos
@@ -274,7 +273,7 @@ def _replayssm_output_only_precompute_kernel(
     B_all = tl.where(offs_k[:, None] == write_pos, B_cur[None, :], B_cache)
     bc = tl.sum(B_all.to(tl.float32) * C[None, :].to(tl.float32), axis=1)
 
-    if QUANT_MODE != 0:
+    if QUANT_MODE == 1:
         B_abs = tl.abs(B_cur.to(tl.float32))
         B_block = offs_n // 32
         B_scale = tl.full((BLOCK_SIZE_DSTATE,), 1.0, tl.float32)
@@ -552,7 +551,7 @@ def _replayssm_output_only_kernel(
         x_all_dot = tl.where(offs_k_dot[None, :] == write_pos, x_cur[:, None], x_all_dot)
         B_all_dot_ptrs = B_cache_ptr + offs_k_dot[:, None] * stride_B_cache_pos + offs_n[None, :] * stride_B_cache_dstate
         B_all_dot = tl.load(B_all_dot_ptrs, mask=(offs_k_dot[:, None] < write_pos) & (offs_n[None, :] < dstate), other=0.0)
-        if QUANT_MODE != 0:
+        if QUANT_MODE == 1:
             B_block = offs_n // 32
             B_scale_dot = tl.load(
                 B_scale_cache_ptr
@@ -677,7 +676,6 @@ def selective_state_update_replayssm_output_only(
     quant_mode_id = {
         "none": _REPLAYSSM_QUANT_NONE,
         "mx8": _REPLAYSSM_QUANT_MX8,
-        "mx8_b_only": _REPLAYSSM_QUANT_MX8_B_ONLY,
     }.get(quant_mode)
     if quant_mode_id is None:
         raise NotImplementedError(f"ReplaySSM quant mode {quant_mode!r} is not implemented")
@@ -705,17 +703,6 @@ def selective_state_update_replayssm_output_only(
             max_cache_len,
             block_size_b_scale,
         )
-    elif quant_mode_id == _REPLAYSSM_QUANT_MX8_B_ONLY:
-        assert x_cache.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        assert B_cache.dtype == torch.float8_e4m3fn
-        assert B_scale_cache is not None
-        assert B_scale_cache.dtype == torch.uint8
-        assert B_scale_cache.shape[1:] == (
-            ngroups,
-            max_cache_len,
-            block_size_b_scale,
-        )
-        x_scale_cache = x_cache
     else:
         x_scale_cache = x_cache
         B_scale_cache = B_cache

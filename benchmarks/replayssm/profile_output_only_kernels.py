@@ -25,8 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--headdim", type=int, default=64)
     parser.add_argument("--dstate", type=int, default=128)
     parser.add_argument("--buffer-len", type=int, default=8)
-    parser.add_argument("--quant-mode", choices=("none", "mx8", "mx8_b_only"),
-                        default="none")
+    parser.add_argument("--quant-mode", choices=("none", "mx8"), default="none")
     parser.add_argument(
         "--write-pos",
         type=int,
@@ -45,6 +44,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="For nonflush mode, cycle write_pos through [0, buffer_len - 1) "
         "inside the measured loop and report the average kernel time.",
+    )
+    parser.add_argument(
+        "--cycle-full-buffer",
+        action="store_true",
+        help="Cycle a full ReplaySSM buffer period in each measured iteration: "
+        "nonflush write_pos 0..buffer_len-2 plus flush write_pos buffer_len-1.",
     )
     return parser.parse_args()
 
@@ -110,19 +115,6 @@ def main() -> None:
             device=device,
             dtype=torch.uint8,
         )
-    elif args.quant_mode == "mx8_b_only":
-        x_cache = torch.randn(batch, nheads, max_cache_len, headdim,
-                              device=device, dtype=dtype)
-        x_scale_cache = None
-        B_cache = torch.randn(batch, ngroups, max_cache_len, dstate,
-                              device=device,
-                              dtype=dtype).to(torch.float8_e4m3fn)
-        B_scale_cache = torch.full(
-            (batch, ngroups, max_cache_len, (dstate + 31) // 32),
-            127,
-            device=device,
-            dtype=torch.uint8,
-        )
     else:
         x_cache = torch.randn(batch, nheads, max_cache_len, headdim,
                               device=device, dtype=dtype)
@@ -135,8 +127,12 @@ def main() -> None:
 
     if args.cycle_nonflush and args.mode != "nonflush":
         raise ValueError("--cycle-nonflush is only valid with --mode nonflush")
+    if args.cycle_full_buffer and args.cycle_nonflush:
+        raise ValueError("--cycle-full-buffer and --cycle-nonflush are mutually exclusive")
 
-    if args.cycle_nonflush:
+    if args.cycle_full_buffer:
+        write_pos_value = 0
+    elif args.cycle_nonflush:
         write_pos_value = 0
     elif args.write_pos is None:
         write_pos_value = max_cache_len - 1 if args.mode == "flush" else max_cache_len // 2
@@ -146,7 +142,8 @@ def main() -> None:
         raise ValueError(
             f"write_pos must be in [0, {max_cache_len}), got {write_pos_value}")
     natural_flush = write_pos_value == max_cache_len - 1
-    if not args.allow_artificial_state and not args.cycle_nonflush:
+    if (not args.allow_artificial_state and not args.cycle_nonflush
+            and not args.cycle_full_buffer):
         if args.mode == "nonflush" and natural_flush:
             raise ValueError(
                 "nonflush with write_pos=buffer_len-1 is not a normal "
@@ -157,7 +154,10 @@ def main() -> None:
                 "flush normally occurs only at write_pos=buffer_len-1; use "
                 "--allow-artificial-state to profile this synthetic combination.")
 
-    if args.mode == "flush":
+    if args.cycle_full_buffer:
+        write_pos = torch.zeros(batch, device=device, dtype=torch.int32)
+        is_flush = torch.zeros(batch, device=device, dtype=torch.bool)
+    elif args.mode == "flush":
         write_pos = torch.full((batch,), write_pos_value,
                                device=device, dtype=torch.int32)
         is_flush = torch.ones(batch, device=device, dtype=torch.bool)
@@ -190,8 +190,16 @@ def main() -> None:
             out=out,
         )
 
+    def run_full_buffer_cycle() -> None:
+        for pos in range(max_cache_len):
+            write_pos.fill_(pos)
+            is_flush.fill_(pos == max_cache_len - 1)
+            run_once()
+
     for _ in range(args.warmup):
-        if args.cycle_nonflush:
+        if args.cycle_full_buffer:
+            run_full_buffer_cycle()
+        elif args.cycle_nonflush:
             for pos in range(max_cache_len - 1):
                 write_pos.fill_(pos)
                 run_once()
@@ -201,6 +209,9 @@ def main() -> None:
 
     torch.cuda.nvtx.range_push(f"replayssm_{args.mode}")
     for _ in range(args.iters):
+        if args.cycle_full_buffer:
+            run_full_buffer_cycle()
+            continue
         if args.cycle_nonflush:
             write_pos.fill_(_ % (max_cache_len - 1))
         run_once()
@@ -208,8 +219,11 @@ def main() -> None:
     torch.cuda.nvtx.range_pop()
 
     pos_desc = (
-        f"cycle=0..{max_cache_len - 2}"
-        if args.cycle_nonflush else f"write_pos={write_pos_value}"
+        f"cycle_full_buffer=0..{max_cache_len - 1}"
+        if args.cycle_full_buffer else (
+            f"cycle=0..{max_cache_len - 2}"
+            if args.cycle_nonflush else f"write_pos={write_pos_value}"
+        )
     )
     print(
         f"mode={args.mode} {pos_desc} iters={args.iters} "
