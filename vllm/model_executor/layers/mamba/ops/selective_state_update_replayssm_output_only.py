@@ -172,6 +172,7 @@ def _replayssm_output_only_precompute_kernel(
     B_scale_cache_ptr,
     write_pos_ptr,
     is_flush_ptr,
+    row_indices_ptr,
     bc_pre_ptr,
     state_batch_indices_ptr,
     null_block_id,
@@ -205,36 +206,40 @@ def _replayssm_output_only_precompute_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     QUANT_MODE: tl.constexpr,
     BLOCK_SIZE_B_SCALE: tl.constexpr,
+    USE_ROW_INDICES: tl.constexpr,
     # heuristic-computed
     BLOCK_SIZE_DSTATE: tl.constexpr,
     HAS_STATE_BATCH_INDICES: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=0)
     pid_g = tl.program_id(axis=1)
+    logical_b = pid_b
+    if USE_ROW_INDICES:
+        logical_b = tl.load(row_indices_ptr + pid_b).to(tl.int64)
 
     # On flush steps the main kernel does not read bc_pre, so skip the work.
-    is_flush = tl.load(is_flush_ptr + pid_b) != 0
+    is_flush = tl.load(is_flush_ptr + logical_b) != 0
     if is_flush:
         return
 
     if HAS_STATE_BATCH_INDICES:
         state_batch_idx = tl.load(
             state_batch_indices_ptr
-            + pid_b * stride_state_indices_batch
+            + logical_b * stride_state_indices_batch
             + 0 * stride_state_indices_T
         ).to(tl.int64)
         if state_batch_idx == null_block_id:
             return
     else:
-        state_batch_idx = pid_b
+        state_batch_idx = logical_b
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
 
-    write_pos = tl.load(write_pos_ptr + pid_b).to(tl.int64)
+    write_pos = tl.load(write_pos_ptr + logical_b).to(tl.int64)
 
-    B_ptr += pid_b * stride_B_batch + pid_g * stride_B_group
-    C_ptr += pid_b * stride_C_batch + pid_g * stride_C_group
+    B_ptr += logical_b * stride_B_batch + pid_g * stride_B_group
+    C_ptr += logical_b * stride_C_batch + pid_g * stride_C_group
     B_cache_ptr += (
         state_batch_idx * stride_B_cache_batch + pid_g * stride_B_cache_group
     )
@@ -242,7 +247,7 @@ def _replayssm_output_only_precompute_kernel(
         state_batch_idx * stride_B_scale_cache_batch
         + pid_g * stride_B_scale_cache_group
     )
-    bc_pre_ptr += pid_b * stride_bc_pre_batch + pid_g * stride_bc_pre_group
+    bc_pre_ptr += logical_b * stride_bc_pre_batch + pid_g * stride_bc_pre_group
 
     B_cur = tl.load(
         B_ptr + offs_n * stride_B_dstate,
@@ -342,6 +347,7 @@ def _replayssm_output_only_kernel(
     bc_pre_ptr,
     write_pos_ptr,
     is_flush_ptr,
+    row_indices_ptr,
     state_batch_indices_ptr,
     null_block_id,
     # Matrix dimensions
@@ -411,6 +417,7 @@ def _replayssm_output_only_kernel(
     QUANT_MODE: tl.constexpr,
     BLOCK_SIZE_B_SCALE: tl.constexpr,
     FLUSH_MODE: tl.constexpr,
+    USE_ROW_INDICES: tl.constexpr,
     # heuristic-computed
     BLOCK_SIZE_DSTATE: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
@@ -421,21 +428,24 @@ def _replayssm_output_only_kernel(
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
+    logical_b = pid_b
+    if USE_ROW_INDICES:
+        logical_b = tl.load(row_indices_ptr + pid_b).to(tl.int64)
 
     # Resolve the physical state slot for this decode row; skip padded rows.
     if HAS_STATE_BATCH_INDICES:
-        state_batch_idx = tl.load(state_batch_indices_ptr + pid_b * stride_state_indices_batch + 0 * stride_state_indices_T).to(tl.int64)
+        state_batch_idx = tl.load(state_batch_indices_ptr + logical_b * stride_state_indices_batch + 0 * stride_state_indices_T).to(tl.int64)
         if state_batch_idx == null_block_id:
             return
     else:
-        state_batch_idx = pid_b
+        state_batch_idx = logical_b
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
 
     # Buffer cursor (number of cached tokens so far) and the flush flag.
-    write_pos = tl.load(write_pos_ptr + pid_b).to(tl.int64)
-    is_flush = tl.load(is_flush_ptr + pid_b) != 0
+    write_pos = tl.load(write_pos_ptr + logical_b).to(tl.int64)
+    is_flush = tl.load(is_flush_ptr + logical_b) != 0
     if FLUSH_MODE == 1:
         if is_flush:
             return
@@ -449,17 +459,17 @@ def _replayssm_output_only_kernel(
 
     # Advance every pointer to this (row, head, group).
     state_ptr += state_batch_idx * stride_state_batch + pid_h * stride_state_head
-    x_ptr += pid_b * stride_x_batch + pid_h * stride_x_head
-    dt_ptr += pid_b * stride_dt_batch + pid_h * stride_dt_head
-    B_ptr += pid_b * stride_B_batch + (pid_h // nheads_ngroups_ratio) * stride_B_group
-    C_ptr += pid_b * stride_C_batch + (pid_h // nheads_ngroups_ratio) * stride_C_group
-    out_ptr += pid_b * stride_out_batch + pid_h * stride_out_head
+    x_ptr += logical_b * stride_x_batch + pid_h * stride_x_head
+    dt_ptr += logical_b * stride_dt_batch + pid_h * stride_dt_head
+    B_ptr += logical_b * stride_B_batch + (pid_h // nheads_ngroups_ratio) * stride_B_group
+    C_ptr += logical_b * stride_C_batch + (pid_h // nheads_ngroups_ratio) * stride_C_group
+    out_ptr += logical_b * stride_out_batch + pid_h * stride_out_head
     x_cache_ptr += state_batch_idx * stride_x_cache_batch + pid_h * stride_x_cache_head
     x_scale_cache_ptr += state_batch_idx * stride_x_scale_cache_batch + pid_h * stride_x_scale_cache_head
     dt_cache_ptr += state_batch_idx * stride_dt_cache_batch + pid_h * stride_dt_cache_head
     B_cache_ptr += state_batch_idx * stride_B_cache_batch + (pid_h // nheads_ngroups_ratio) * stride_B_cache_group
     B_scale_cache_ptr += state_batch_idx * stride_B_scale_cache_batch + (pid_h // nheads_ngroups_ratio) * stride_B_scale_cache_group
-    bc_pre_ptr += pid_b * stride_bc_pre_batch + (pid_h // nheads_ngroups_ratio) * stride_bc_pre_group
+    bc_pre_ptr += logical_b * stride_bc_pre_batch + (pid_h // nheads_ngroups_ratio) * stride_bc_pre_group
 
     # Current-token dt (+ bias, softplus), scalar A, current x / C, checkpoint
     # state S_0, and current-token B (shared by both routes below).
@@ -590,7 +600,7 @@ def _replayssm_output_only_kernel(
         D = tl.load(D_ptr + offs_m * stride_D_dim, mask=offs_m < dim, other=0.0).to(tl.float32)
         out += x_cur.to(tl.float32) * D
     if HAS_Z:
-        z_ptr += pid_b * stride_z_batch + pid_h * stride_z_head
+        z_ptr += logical_b * stride_z_batch + pid_h * stride_z_head
         z = tl.load(z_ptr + offs_m * stride_z_dim, mask=offs_m < dim, other=0.0).to(tl.float32)
         out *= z * tl.sigmoid(z)
 
@@ -625,6 +635,10 @@ def selective_state_update_replayssm_output_only(
     bc_pre: torch.Tensor | None = None,
     write_pos: torch.Tensor | None = None,
     is_flush: torch.Tensor | None = None,
+    nonflush_row_indices: torch.Tensor | None = None,
+    flush_row_indices: torch.Tensor | None = None,
+    num_nonflush_rows: int | None = None,
+    num_flush_rows: int | None = None,
     max_cache_len: int = 16,
     state_batch_indices: torch.Tensor | None = None,
     null_block_id: int = NULL_BLOCK_ID,
@@ -724,6 +738,14 @@ def selective_state_update_replayssm_output_only(
     assert write_pos.dtype == torch.int32
     assert is_flush is not None and is_flush.shape[0] >= batch
     assert is_flush.dtype in (torch.bool, torch.int8)
+    if nonflush_row_indices is not None:
+        assert nonflush_row_indices.dtype == torch.int32
+        assert num_nonflush_rows is not None
+        assert nonflush_row_indices.shape[0] >= num_nonflush_rows
+    if flush_row_indices is not None:
+        assert flush_row_indices.dtype == torch.int32
+        assert num_flush_rows is not None
+        assert flush_row_indices.shape[0] >= num_flush_rows
     assert bc_pre is not None
     assert bc_pre.shape[0] >= batch and bc_pre.shape[1] >= ngroups
     assert bc_pre.shape[2] == max_cache_len
@@ -732,7 +754,28 @@ def selective_state_update_replayssm_output_only(
         assert state_batch_indices.shape[0] >= batch
         assert state_batch_indices.shape[1] >= 1
 
-    grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
+    if num_nonflush_rows is None:
+        num_nonflush_rows = batch
+    if num_flush_rows is None:
+        num_flush_rows = batch
+    use_nonflush_indices = nonflush_row_indices is not None
+    use_flush_indices = flush_row_indices is not None
+    nonflush_row_indices_arg = (
+        nonflush_row_indices if nonflush_row_indices is not None else write_pos
+    )
+    flush_row_indices_arg = (
+        flush_row_indices if flush_row_indices is not None else write_pos
+    )
+    nonflush_grid = lambda META: (
+        triton.cdiv(dim, META["BLOCK_SIZE_M"]),
+        num_nonflush_rows,
+        nheads,
+    )
+    flush_grid = lambda META: (
+        triton.cdiv(dim, META["BLOCK_SIZE_M"]),
+        num_flush_rows,
+        nheads,
+    )
     z_strides = (z.stride(0), z.stride(1), z.stride(2)) if z is not None else (0, 0, 0)
     state_indices_strides = (
         (state_batch_indices.stride(0), state_batch_indices.stride(1))
@@ -741,45 +784,50 @@ def selective_state_update_replayssm_output_only(
     )
 
     with torch.accelerator.device_index(x.device.index):
-        _replayssm_output_only_precompute_kernel[(batch, ngroups)](
-            B,
-            C,
-            B_cache,
-            B_scale_cache,
-            write_pos,
-            is_flush,
-            bc_pre,
-            state_batch_indices,
-            null_block_id,
-            batch,
-            ngroups,
-            dstate,
-            B.stride(0),
-            B.stride(1),
-            B.stride(2),
-            C.stride(0),
-            C.stride(1),
-            C.stride(2),
-            B_cache.stride(0),
-            B_cache.stride(1),
-            B_cache.stride(2),
-            B_cache.stride(3),
-            B_scale_cache.stride(0),
-            B_scale_cache.stride(1),
-            B_scale_cache.stride(2),
-            B_scale_cache.stride(3),
-            bc_pre.stride(0),
-            bc_pre.stride(1),
-            bc_pre.stride(2),
-            state_indices_strides[0],
-            state_indices_strides[1],
-            max_cache_len,
-            block_size_k_cache,
-            quant_mode_id,
-            block_size_b_scale,
-            num_warps=2,
-        )
-        main_args = (
+        if num_nonflush_rows > 0:
+            _replayssm_output_only_precompute_kernel[
+                (num_nonflush_rows, ngroups)
+            ](
+                B,
+                C,
+                B_cache,
+                B_scale_cache,
+                write_pos,
+                is_flush,
+                nonflush_row_indices_arg,
+                bc_pre,
+                state_batch_indices,
+                null_block_id,
+                batch,
+                ngroups,
+                dstate,
+                B.stride(0),
+                B.stride(1),
+                B.stride(2),
+                C.stride(0),
+                C.stride(1),
+                C.stride(2),
+                B_cache.stride(0),
+                B_cache.stride(1),
+                B_cache.stride(2),
+                B_cache.stride(3),
+                B_scale_cache.stride(0),
+                B_scale_cache.stride(1),
+                B_scale_cache.stride(2),
+                B_scale_cache.stride(3),
+                bc_pre.stride(0),
+                bc_pre.stride(1),
+                bc_pre.stride(2),
+                state_indices_strides[0],
+                state_indices_strides[1],
+                max_cache_len,
+                block_size_k_cache,
+                quant_mode_id,
+                block_size_b_scale,
+                use_nonflush_indices,
+                num_warps=2,
+            )
+        main_args_head = (
             state,
             x,
             dt,
@@ -798,6 +846,8 @@ def selective_state_update_replayssm_output_only(
             bc_pre,
             write_pos,
             is_flush,
+        )
+        main_args_tail = (
             state_batch_indices,
             null_block_id,
             batch,
@@ -862,16 +912,24 @@ def selective_state_update_replayssm_output_only(
             quant_mode_id,
             block_size_b_scale,
         )
-        _replayssm_output_only_kernel[grid](
-            *main_args,
-            _REPLAYSSM_FLUSH_NONFLUSH_ONLY,
-            num_warps=num_warps,
-        )
-        _replayssm_output_only_kernel[grid](
-            *main_args,
-            _REPLAYSSM_FLUSH_FLUSH_ONLY,
-            num_warps=num_warps,
-        )
+        if num_nonflush_rows > 0:
+            _replayssm_output_only_kernel[nonflush_grid](
+                *main_args_head,
+                nonflush_row_indices_arg,
+                *main_args_tail,
+                _REPLAYSSM_FLUSH_NONFLUSH_ONLY,
+                use_nonflush_indices,
+                num_warps=num_warps,
+            )
+        if num_flush_rows > 0:
+            _replayssm_output_only_kernel[flush_grid](
+                *main_args_head,
+                flush_row_indices_arg,
+                *main_args_tail,
+                _REPLAYSSM_FLUSH_FLUSH_ONLY,
+                use_flush_indices,
+                num_warps=num_warps,
+            )
 
     _profile_replayssm_cache_slots(
         x_cache,

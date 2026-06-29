@@ -176,6 +176,18 @@ def main() -> None:
                            device=device, dtype=torch.int32)
     is_flush = torch.full((batch,), args.mode == "flush",
                           device=device, dtype=torch.bool)
+    all_rows = torch.arange(batch, device=device, dtype=torch.int32)
+    empty_rows = all_rows[:0]
+    if args.mode == "flush":
+        nonflush_row_indices = empty_rows
+        flush_row_indices = all_rows
+        num_nonflush_rows = 0
+        num_flush_rows = batch
+    else:
+        nonflush_row_indices = all_rows
+        flush_row_indices = empty_rows
+        num_nonflush_rows = batch
+        num_flush_rows = 0
 
     def run_once() -> None:
         if args.flush_specialization == "constexpr":
@@ -223,6 +235,10 @@ def main() -> None:
             bc_pre=bc_pre,
             write_pos=write_pos,
             is_flush=is_flush,
+            nonflush_row_indices=nonflush_row_indices,
+            flush_row_indices=flush_row_indices,
+            num_nonflush_rows=num_nonflush_rows,
+            num_flush_rows=num_flush_rows,
             max_cache_len=max_cache_len,
             quant_mode=args.quant_mode,
             out=out,

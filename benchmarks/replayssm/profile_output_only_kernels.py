@@ -165,6 +165,28 @@ def main() -> None:
         write_pos = torch.full((batch,), write_pos_value,
                                device=device, dtype=torch.int32)
         is_flush = torch.zeros(batch, device=device, dtype=torch.bool)
+    all_rows = torch.arange(batch, device=device, dtype=torch.int32)
+    empty_rows = all_rows[:0]
+    nonflush_row_indices = all_rows
+    flush_row_indices = empty_rows
+    num_nonflush_rows = batch
+    num_flush_rows = 0
+
+    def update_row_indices(pos: int) -> None:
+        nonlocal nonflush_row_indices, flush_row_indices
+        nonlocal num_nonflush_rows, num_flush_rows
+        if pos == max_cache_len - 1:
+            nonflush_row_indices = empty_rows
+            flush_row_indices = all_rows
+            num_nonflush_rows = 0
+            num_flush_rows = batch
+        else:
+            nonflush_row_indices = all_rows
+            flush_row_indices = empty_rows
+            num_nonflush_rows = batch
+            num_flush_rows = 0
+
+    update_row_indices(write_pos_value)
 
     def run_once() -> None:
         selective_state_update_replayssm_output_only(
@@ -185,6 +207,10 @@ def main() -> None:
             bc_pre=bc_pre,
             write_pos=write_pos,
             is_flush=is_flush,
+            nonflush_row_indices=nonflush_row_indices,
+            flush_row_indices=flush_row_indices,
+            num_nonflush_rows=num_nonflush_rows,
+            num_flush_rows=num_flush_rows,
             max_cache_len=max_cache_len,
             quant_mode=args.quant_mode,
             out=out,
@@ -194,6 +220,7 @@ def main() -> None:
         for pos in range(max_cache_len):
             write_pos.fill_(pos)
             is_flush.fill_(pos == max_cache_len - 1)
+            update_row_indices(pos)
             run_once()
 
     for _ in range(args.warmup):
@@ -202,6 +229,7 @@ def main() -> None:
         elif args.cycle_nonflush:
             for pos in range(max_cache_len - 1):
                 write_pos.fill_(pos)
+                update_row_indices(pos)
                 run_once()
         else:
             run_once()
@@ -213,7 +241,9 @@ def main() -> None:
             run_full_buffer_cycle()
             continue
         if args.cycle_nonflush:
-            write_pos.fill_(_ % (max_cache_len - 1))
+            pos = _ % (max_cache_len - 1)
+            write_pos.fill_(pos)
+            update_row_indices(pos)
         run_once()
     torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()

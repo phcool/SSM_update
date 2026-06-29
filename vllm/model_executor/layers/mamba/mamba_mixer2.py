@@ -1320,6 +1320,12 @@ class MambaMixer2(MambaBase, PluggableLayer):
                         bc_pre=attn_metadata.bc_pre_scratch,
                         write_pos=attn_metadata.write_pos_d,
                         is_flush=attn_metadata.is_flush_d,
+                        nonflush_row_indices=(
+                            attn_metadata.nonflush_row_indices_d
+                        ),
+                        flush_row_indices=attn_metadata.flush_row_indices_d,
+                        num_nonflush_rows=attn_metadata.num_nonflush_rows,
+                        num_flush_rows=attn_metadata.num_flush_rows,
                         max_cache_len=self.max_cache_len,
                         quant_mode=self.replayssm_quant_mode,
                         state_batch_indices=state_indices_tensor_d_input,

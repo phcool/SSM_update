@@ -76,6 +76,10 @@ class BaseMambaAttentionMetadata:
     token_chunk_offset_ptr: torch.Tensor | None = None
     write_pos_d: torch.Tensor | None = None
     is_flush_d: torch.Tensor | None = None
+    nonflush_row_indices_d: torch.Tensor | None = None
+    flush_row_indices_d: torch.Tensor | None = None
+    num_nonflush_rows: int = 0
+    num_flush_rows: int = 0
     # Shared per-step scratch for the output-only (output_only) variant:
     # (decode_rows, ngroups, max_cache_len) fp32. None for the recurrent
     # variant or when the cached kernel is disabled.
@@ -553,6 +557,10 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         write_pos_d = None
         is_flush_d = None
+        nonflush_row_indices_d = None
+        flush_row_indices_d = None
+        num_nonflush_rows = 0
+        num_flush_rows = 0
 
         if self.vllm_config.cache_config.mamba_cache_mode == "all":
             num_computed_tokens = common_attn_metadata.compute_num_computed_tokens()
@@ -679,6 +687,26 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 dtype=torch.int8,
                 device=common_attn_metadata.query_start_loc.device,
             )
+            nonflush_rows_cpu = torch.nonzero(
+                (is_flush_cpu == 0) & valid_decode_rows,
+                as_tuple=False,
+            ).flatten().to(torch.int32)
+            flush_rows_cpu = torch.nonzero(
+                (is_flush_cpu != 0) & valid_decode_rows,
+                as_tuple=False,
+            ).flatten().to(torch.int32)
+            num_nonflush_rows = int(nonflush_rows_cpu.numel())
+            num_flush_rows = int(flush_rows_cpu.numel())
+            nonflush_row_indices_d = async_tensor_h2d(
+                nonflush_rows_cpu.tolist(),
+                dtype=torch.int32,
+                device=common_attn_metadata.query_start_loc.device,
+            )
+            flush_row_indices_d = async_tensor_h2d(
+                flush_rows_cpu.tolist(),
+                dtype=torch.int32,
+                device=common_attn_metadata.query_start_loc.device,
+            )
 
         bc_pre_scratch = None
         if (
@@ -783,6 +811,10 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             state_indices_tensor_d=state_indices_tensor_d,
             write_pos_d=write_pos_d,
             is_flush_d=is_flush_d,
+            nonflush_row_indices_d=nonflush_row_indices_d,
+            flush_row_indices_d=flush_row_indices_d,
+            num_nonflush_rows=num_nonflush_rows,
+            num_flush_rows=num_flush_rows,
             bc_pre_scratch=bc_pre_scratch,
             spec_write_pos_d=spec_write_pos_d,
             spec_post_origin_d=spec_post_origin_d,
@@ -824,6 +856,10 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         )
         write_pos_d = metadata.write_pos_d
         is_flush_d = metadata.is_flush_d
+        nonflush_row_indices_d = metadata.nonflush_row_indices_d
+        flush_row_indices_d = metadata.flush_row_indices_d
+        num_nonflush_rows = metadata.num_nonflush_rows
+        num_flush_rows = metadata.num_flush_rows
         bc_pre_scratch = metadata.bc_pre_scratch
         # cached-spec cursors are full (num_blocks,) fixed-address buffers indexed
         # by physical block id, so they need NO per-batch padding (padding rows
@@ -927,6 +963,10 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             num_accepted_tokens=num_accepted_tokens,
             write_pos_d=write_pos_d,
             is_flush_d=is_flush_d,
+            nonflush_row_indices_d=nonflush_row_indices_d,
+            flush_row_indices_d=flush_row_indices_d,
+            num_nonflush_rows=num_nonflush_rows,
+            num_flush_rows=num_flush_rows,
             bc_pre_scratch=bc_pre_scratch,
             spec_write_pos_d=spec_write_pos_d,
             spec_post_origin_d=spec_post_origin_d,
