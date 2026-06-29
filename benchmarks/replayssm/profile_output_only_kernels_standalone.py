@@ -23,9 +23,7 @@ def _softplus(x):
     return tl.log(1.0 + tl.exp(x))
 
 
-def _load_replayssm_op():
-    root = Path(__file__).resolve().parents[2]
-
+def _install_vllm_stubs() -> None:
     triton_utils = types.ModuleType("vllm.triton_utils")
     triton_utils.triton = triton
     triton_utils.tl = tl
@@ -43,6 +41,10 @@ def _load_replayssm_op():
     sys.modules["vllm.model_executor.layers.mamba.ops.mamba_ssm"] = mamba_ssm
     sys.modules["vllm.v1.attention.backends.utils"] = attn_utils
 
+
+def _load_replayssm_op(filename: str, attr_name: str):
+    root = Path(__file__).resolve().parents[2]
+
     op_path = (
         root
         / "vllm"
@@ -50,16 +52,25 @@ def _load_replayssm_op():
         / "layers"
         / "mamba"
         / "ops"
-        / "selective_state_update_replayssm_output_only.py"
+        / filename
     )
-    spec = importlib.util.spec_from_file_location("replayssm_output_only_op", op_path)
+    module_name = f"replayssm_output_only_op_{op_path.stem}"
+    spec = importlib.util.spec_from_file_location(module_name, op_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.selective_state_update_replayssm_output_only
+    return getattr(module, attr_name)
 
 
-selective_state_update_replayssm_output_only = _load_replayssm_op()
+_install_vllm_stubs()
+selective_state_update_replayssm_output_only = _load_replayssm_op(
+    "selective_state_update_replayssm_output_only.py",
+    "selective_state_update_replayssm_output_only",
+)
+selective_state_update_replayssm_output_only_constexpr_flush = _load_replayssm_op(
+    "selective_state_update_replayssm_output_only_constexpr_flush.py",
+    "selective_state_update_replayssm_output_only_constexpr_flush",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,6 +86,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--buffer-len", type=int, default=8)
     parser.add_argument("--quant-mode", choices=("none", "mx8"), default="none")
     parser.add_argument("--write-pos", type=int, default=None)
+    parser.add_argument(
+        "--flush-specialization",
+        choices=("runtime", "constexpr"),
+        default="runtime",
+        help="Use the official runtime is_flush tensor branch or the experimental"
+        " launch-wide tl.constexpr flush branch.",
+    )
     return parser.parse_args()
 
 
@@ -160,6 +178,33 @@ def main() -> None:
                           device=device, dtype=torch.bool)
 
     def run_once() -> None:
+        if args.flush_specialization == "constexpr":
+            if args.quant_mode != "none":
+                raise ValueError("--flush-specialization constexpr only supports none")
+            selective_state_update_replayssm_output_only_constexpr_flush(
+                state,
+                x,
+                dt,
+                a,
+                b,
+                c,
+                D=d,
+                dt_bias=dt_bias,
+                dt_softplus=True,
+                x_cache=x_cache,
+                x_scale_cache=x_scale_cache,
+                dt_cache=dt_cache,
+                B_cache=b_cache,
+                B_scale_cache=b_scale_cache,
+                bc_pre=bc_pre,
+                write_pos=write_pos,
+                is_flush=args.mode == "flush",
+                max_cache_len=max_cache_len,
+                quant_mode=args.quant_mode,
+                out=out,
+            )
+            return
+
         selective_state_update_replayssm_output_only(
             state,
             x,
@@ -193,7 +238,8 @@ def main() -> None:
 
     print(
         f"mode={args.mode} write_pos={write_pos_value} iters={args.iters} "
-        f"quant_mode={args.quant_mode} batch={batch} buffer_len={max_cache_len}"
+        f"quant_mode={args.quant_mode} batch={batch} buffer_len={max_cache_len} "
+        f"flush_specialization={args.flush_specialization}"
     )
 
 
