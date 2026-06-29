@@ -18,6 +18,9 @@ _OUTLIER_PROFILE_FILE = None
 _OUTLIER_PROFILE_PATH = None
 _REPLAYSSM_QUANT_NONE = 0
 _REPLAYSSM_QUANT_MX8 = 1
+_REPLAYSSM_FLUSH_RUNTIME = 0
+_REPLAYSSM_FLUSH_NONFLUSH_ONLY = 1
+_REPLAYSSM_FLUSH_FLUSH_ONLY = 2
 _OCP_MX_BLOCK_SIZE = 32
 _E4M3_MAX = 448.0
 
@@ -407,6 +410,7 @@ def _replayssm_output_only_kernel(
     BLOCK_SIZE_K_DOT: tl.constexpr,
     QUANT_MODE: tl.constexpr,
     BLOCK_SIZE_B_SCALE: tl.constexpr,
+    FLUSH_MODE: tl.constexpr,
     # heuristic-computed
     BLOCK_SIZE_DSTATE: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
@@ -432,6 +436,16 @@ def _replayssm_output_only_kernel(
     # Buffer cursor (number of cached tokens so far) and the flush flag.
     write_pos = tl.load(write_pos_ptr + pid_b).to(tl.int64)
     is_flush = tl.load(is_flush_ptr + pid_b) != 0
+    if FLUSH_MODE == 1:
+        if is_flush:
+            return
+        do_flush = False
+    elif FLUSH_MODE == 2:
+        if not is_flush:
+            return
+        do_flush = True
+    else:
+        do_flush = is_flush
 
     # Advance every pointer to this (row, head, group).
     state_ptr += state_batch_idx * stride_state_batch + pid_h * stride_state_head
@@ -461,7 +475,7 @@ def _replayssm_output_only_kernel(
     state = tl.load(state_ptrs, mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate), other=0.0)
     B_cur = tl.load(B_ptr + offs_n * stride_B_dstate, mask=offs_n < dstate, other=0.0)
 
-    if not is_flush:
+    if not do_flush:
         # Output-only route: read y without materializing the state, using the
         # precomputed k^T q products (`bc`):
         #   y = total_decay * (S_0 q) + sum_j s_j (k_j^T q) v_j.
@@ -765,7 +779,7 @@ def selective_state_update_replayssm_output_only(
             block_size_b_scale,
             num_warps=2,
         )
-        _replayssm_output_only_kernel[grid](
+        main_args = (
             state,
             x,
             dt,
@@ -847,6 +861,15 @@ def selective_state_update_replayssm_output_only(
             block_size_k_dot,
             quant_mode_id,
             block_size_b_scale,
+        )
+        _replayssm_output_only_kernel[grid](
+            *main_args,
+            _REPLAYSSM_FLUSH_NONFLUSH_ONLY,
+            num_warps=num_warps,
+        )
+        _replayssm_output_only_kernel[grid](
+            *main_args,
+            _REPLAYSSM_FLUSH_FLUSH_ONLY,
             num_warps=num_warps,
         )
 
