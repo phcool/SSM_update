@@ -180,6 +180,14 @@ def maybe_plot(matrix: np.ndarray, layer_types: list[str], span_names: list[str]
     plt.close(fig)
 
 
+def layer_roles_from_config(model, n_layers: int) -> list[str]:
+    pattern = getattr(model.config, "hybrid_override_pattern", None)
+    if isinstance(pattern, str) and len(pattern) >= n_layers:
+        names = {"M": "Mamba", "*": "Attention", "-": "MLP", "E": "MoE"}
+        return [names.get(ch, ch) for ch in pattern[:n_layers]]
+    return ["Block"] * n_layers
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -234,10 +242,7 @@ def main() -> None:
                 flush=True,
             )
 
-    layer_types = [
-        layer.__class__.__name__.replace("NemotronH", "").replace(
-            "DecoderLayer", "") for layer in layers
-    ]
+    layer_types = layer_roles_from_config(model, len(layers))
     npz_path = args.output_dir / "needle_activation_patching.npz"
     json_path = args.output_dir / "needle_activation_patching.json"
     np.savez_compressed(npz_path, raw_scores=raw, recovery=recovery)
