@@ -34,6 +34,8 @@ def parse_args() -> argparse.Namespace:
                         default="bfloat16")
     parser.add_argument("--output-dir", type=Path,
                         default=Path("results/needle_patching"))
+    parser.add_argument("--score-mode", choices=("target_logit", "margin"),
+                        default="target_logit")
     parser.add_argument("--plot", action="store_true")
     return parser.parse_args()
 
@@ -72,9 +74,14 @@ def first_token_id(tokenizer, text: str) -> int:
     return int(ids[0])
 
 
-def score_logits(logits: torch.Tensor, clean_id: int, corrupt_id: int) -> float:
+def score_logits(logits: torch.Tensor, clean_id: int, corrupt_id: int,
+                 score_mode: str) -> float:
     last = logits[0, -1].float()
-    return float((last[clean_id] - last[corrupt_id]).detach().cpu())
+    if score_mode == "target_logit":
+        return float(last[clean_id].detach().cpu())
+    if score_mode == "margin":
+        return float((last[clean_id] - last[corrupt_id]).detach().cpu())
+    raise ValueError(score_mode)
 
 
 def run_logits(model, input_ids: torch.Tensor) -> torch.Tensor:
@@ -120,7 +127,8 @@ def patch_output(output: Any, clean: torch.Tensor,
 
 def run_patched_score(model: nn.Module, layer: nn.Module, clean: torch.Tensor,
                       corrupt_ids: torch.Tensor, span: tuple[int, int],
-                      clean_id: int, corrupt_id: int) -> float:
+                      clean_id: int, corrupt_id: int,
+                      score_mode: str) -> float:
     def hook(_module, _inputs, output):
         return patch_output(output, clean, span)
 
@@ -129,7 +137,7 @@ def run_patched_score(model: nn.Module, layer: nn.Module, clean: torch.Tensor,
         logits = run_logits(model, corrupt_ids)
     finally:
         handle.remove()
-    return score_logits(logits, clean_id, corrupt_id)
+    return score_logits(logits, clean_id, corrupt_id, score_mode)
 
 
 def make_spans(spans: dict[str, int]) -> dict[str, tuple[int, int]]:
@@ -215,11 +223,16 @@ def main() -> None:
     corrupt_id = first_token_id(tokenizer, args.corrupt_answer)
     clean_logits = run_logits(model, clean_ids)
     corrupt_logits = run_logits(model, corrupt_ids)
-    clean_score = score_logits(clean_logits, clean_id, corrupt_id)
-    corrupt_score = score_logits(corrupt_logits, clean_id, corrupt_id)
+    clean_score = score_logits(clean_logits, clean_id, corrupt_id,
+                               args.score_mode)
+    corrupt_score = score_logits(corrupt_logits, clean_id, corrupt_id,
+                                 args.score_mode)
     denom = clean_score - corrupt_score
     if abs(denom) < 1e-6:
-        raise RuntimeError("clean and corrupt score margin is too small")
+        raise RuntimeError(
+            "clean and corrupt score difference is too small: "
+            f"clean_score={clean_score}, corrupt_score={corrupt_score}, "
+            f"score_mode={args.score_mode}")
 
     clean_outputs = capture_layer_outputs(model, layers, clean_ids)
     span_map = make_spans(spans)
@@ -231,7 +244,7 @@ def main() -> None:
         for span_idx, span_name in enumerate(span_names):
             patched_score = run_patched_score(model, layer, clean, corrupt_ids,
                                               span_map[span_name], clean_id,
-                                              corrupt_id)
+                                              corrupt_id, args.score_mode)
             raw[layer_idx, span_idx] = patched_score
             recovery[layer_idx, span_idx] = (
                 (patched_score - corrupt_score) / denom
@@ -257,6 +270,7 @@ def main() -> None:
         "clean_score": clean_score,
         "corrupt_score": corrupt_score,
         "score_denom": denom,
+        "score_mode": args.score_mode,
         "layer_module_list": layer_name,
         "layer_types": layer_types,
         "spans": spans,
