@@ -31,6 +31,8 @@ def parse_args() -> argparse.Namespace:
                         default=Path("results/needle_attribution"))
     parser.add_argument("--max-new-tokens-check", type=int, default=0)
     parser.add_argument("--plot", action="store_true")
+    parser.add_argument("--plot-only", action="store_true",
+                        help="Plot existing output-dir JSON/NPZ without rerunning the model.")
     return parser.parse_args()
 
 
@@ -195,6 +197,20 @@ def maybe_plot(attribution: np.ndarray, spans: dict[str, int], out_png: Path):
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.plot_only:
+        json_path = args.output_dir / "needle_grad_attribution.json"
+        npz_path = args.output_dir / "needle_grad_attribution.npz"
+        result = json.loads(json_path.read_text())
+        attribution = np.load(npz_path)["attribution"]
+        maybe_plot(attribution, result["spans"],
+                   args.output_dir / "needle_grad_attribution.png")
+        print(json.dumps({
+            "json": str(json_path),
+            "npz": str(npz_path),
+            "png": str(args.output_dir / "needle_grad_attribution.png"),
+        }, indent=2, sort_keys=True))
+        return
+
     dtype = dtype_from_name(args.dtype)
     tokenizer, model = load_model(args.model, dtype, args.device)
     prompt, spans = make_prompt(tokenizer, args.context_tokens,
