@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +39,16 @@ def parse_args() -> argparse.Namespace:
                         choices=("answer_logprob", "target_logit", "margin"),
                         default="answer_logprob")
     parser.add_argument("--plot", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def load_model(model_id: str, dtype: torch.dtype, device: str):
@@ -220,6 +230,7 @@ def layer_roles_from_config(model, n_layers: int) -> list[str]:
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    set_seed(args.seed)
     dtype = dtype_from_name(args.dtype)
     tokenizer, model = load_model(args.model, dtype, args.device)
     layer_name, layers = find_layer_list(model)
@@ -298,6 +309,7 @@ def main() -> None:
         "needle_pos_frac": args.needle_pos_frac,
         "clean_answer": args.clean_answer,
         "corrupt_answer": args.corrupt_answer,
+        "seed": args.seed,
         "clean_token_id": clean_id,
         "clean_answer_token_ids": clean_answer_ids,
         "corrupt_token_id": corrupt_id,
