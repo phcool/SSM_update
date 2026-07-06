@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
                         default="bfloat16")
     parser.add_argument("--output-dir", type=Path,
                         default=Path("results/needle_attribution"))
-    parser.add_argument("--max-new-tokens-check", type=int, default=8)
+    parser.add_argument("--max-new-tokens-check", type=int, default=0)
     parser.add_argument("--plot", action="store_true")
     return parser.parse_args()
 
@@ -201,8 +201,10 @@ def main() -> None:
                                 args.needle_pos_frac, args.answer)
     input_ids = tokenizer(prompt, return_tensors="pt",
                           add_special_tokens=False).input_ids.to(args.device)
-    generated_check = run_generation_check(model, tokenizer, input_ids,
-                                           args.max_new_tokens_check)
+    generated_check = None
+    if args.max_new_tokens_check > 0:
+        generated_check = run_generation_check(model, tokenizer, input_ids,
+                                               args.max_new_tokens_check)
     attribution, signed_attribution, meta = compute_grad_attribution(
         model, tokenizer, prompt, args.answer, args.device)
 
