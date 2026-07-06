@@ -34,8 +34,9 @@ def parse_args() -> argparse.Namespace:
                         default="bfloat16")
     parser.add_argument("--output-dir", type=Path,
                         default=Path("results/needle_patching"))
-    parser.add_argument("--score-mode", choices=("target_logit", "margin"),
-                        default="target_logit")
+    parser.add_argument("--score-mode",
+                        choices=("answer_logprob", "target_logit", "margin"),
+                        default="answer_logprob")
     parser.add_argument("--plot", action="store_true")
     return parser.parse_args()
 
@@ -84,6 +85,24 @@ def score_logits(logits: torch.Tensor, clean_id: int, corrupt_id: int,
     raise ValueError(score_mode)
 
 
+def score_answer_logprob(logits: torch.Tensor, answer_ids: list[int],
+                         prompt_len: int) -> float:
+    total = torch.zeros((), device=logits.device, dtype=torch.float32)
+    for i, token_id in enumerate(answer_ids):
+        pos = prompt_len - 1 + i
+        log_probs = torch.log_softmax(logits[0, pos].float(), dim=-1)
+        total = total + log_probs[token_id]
+    return float(total.detach().cpu())
+
+
+def score_model_output(logits: torch.Tensor, clean_id: int, corrupt_id: int,
+                       score_mode: str, answer_ids: list[int],
+                       prompt_len: int) -> float:
+    if score_mode == "answer_logprob":
+        return score_answer_logprob(logits, answer_ids, prompt_len)
+    return score_logits(logits, clean_id, corrupt_id, score_mode)
+
+
 def run_logits(model, input_ids: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
         out = model(input_ids=input_ids, use_cache=False, return_dict=True)
@@ -128,7 +147,8 @@ def patch_output(output: Any, clean: torch.Tensor,
 def run_patched_score(model: nn.Module, layer: nn.Module, clean: torch.Tensor,
                       corrupt_ids: torch.Tensor, span: tuple[int, int],
                       clean_id: int, corrupt_id: int,
-                      score_mode: str) -> float:
+                      score_mode: str, answer_ids: list[int],
+                      prompt_len: int) -> float:
     def hook(_module, _inputs, output):
         return patch_output(output, clean, span)
 
@@ -137,7 +157,8 @@ def run_patched_score(model: nn.Module, layer: nn.Module, clean: torch.Tensor,
         logits = run_logits(model, corrupt_ids)
     finally:
         handle.remove()
-    return score_logits(logits, clean_id, corrupt_id, score_mode)
+    return score_model_output(logits, clean_id, corrupt_id, score_mode,
+                              answer_ids, prompt_len)
 
 
 def make_spans(spans: dict[str, int]) -> dict[str, tuple[int, int]]:
@@ -212,21 +233,32 @@ def main() -> None:
     if spans != corrupt_spans:
         raise ValueError(f"clean/corrupt spans differ: {spans} vs {corrupt_spans}")
 
-    clean_ids = tokenizer(clean_prompt, return_tensors="pt",
-                          add_special_tokens=False).input_ids.to(args.device)
-    corrupt_ids = tokenizer(corrupt_prompt, return_tensors="pt",
-                            add_special_tokens=False).input_ids.to(args.device)
-    if clean_ids.shape != corrupt_ids.shape:
-        raise ValueError(f"shape mismatch: {clean_ids.shape} vs {corrupt_ids.shape}")
+    clean_prompt_ids = tokenizer(clean_prompt, return_tensors="pt",
+                                 add_special_tokens=False).input_ids.to(args.device)
+    corrupt_prompt_ids = tokenizer(corrupt_prompt, return_tensors="pt",
+                                   add_special_tokens=False).input_ids.to(args.device)
+    if clean_prompt_ids.shape != corrupt_prompt_ids.shape:
+        raise ValueError(
+            f"shape mismatch: {clean_prompt_ids.shape} vs {corrupt_prompt_ids.shape}")
 
     clean_id = first_token_id(tokenizer, args.clean_answer)
     corrupt_id = first_token_id(tokenizer, args.corrupt_answer)
+    clean_answer_ids = tokenizer.encode(args.clean_answer,
+                                        add_special_tokens=False)
+    answer_suffix = torch.tensor([clean_answer_ids],
+                                 device=args.device,
+                                 dtype=clean_prompt_ids.dtype)
+    clean_ids = torch.cat([clean_prompt_ids, answer_suffix], dim=1)
+    corrupt_ids = torch.cat([corrupt_prompt_ids, answer_suffix], dim=1)
+    prompt_len = int(clean_prompt_ids.shape[1])
     clean_logits = run_logits(model, clean_ids)
     corrupt_logits = run_logits(model, corrupt_ids)
-    clean_score = score_logits(clean_logits, clean_id, corrupt_id,
-                               args.score_mode)
-    corrupt_score = score_logits(corrupt_logits, clean_id, corrupt_id,
-                                 args.score_mode)
+    clean_score = score_model_output(clean_logits, clean_id, corrupt_id,
+                                     args.score_mode, clean_answer_ids,
+                                     prompt_len)
+    corrupt_score = score_model_output(corrupt_logits, clean_id, corrupt_id,
+                                       args.score_mode, clean_answer_ids,
+                                       prompt_len)
     denom = clean_score - corrupt_score
     if abs(denom) < 1e-6:
         raise RuntimeError(
@@ -244,7 +276,8 @@ def main() -> None:
         for span_idx, span_name in enumerate(span_names):
             patched_score = run_patched_score(model, layer, clean, corrupt_ids,
                                               span_map[span_name], clean_id,
-                                              corrupt_id, args.score_mode)
+                                              corrupt_id, args.score_mode,
+                                              clean_answer_ids, prompt_len)
             raw[layer_idx, span_idx] = patched_score
             recovery[layer_idx, span_idx] = (
                 (patched_score - corrupt_score) / denom
@@ -266,7 +299,9 @@ def main() -> None:
         "clean_answer": args.clean_answer,
         "corrupt_answer": args.corrupt_answer,
         "clean_token_id": clean_id,
+        "clean_answer_token_ids": clean_answer_ids,
         "corrupt_token_id": corrupt_id,
+        "prompt_len": prompt_len,
         "clean_score": clean_score,
         "corrupt_score": corrupt_score,
         "score_denom": denom,
