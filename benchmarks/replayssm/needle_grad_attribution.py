@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
 from pathlib import Path
 
 import numpy as np
@@ -34,7 +33,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plot", action="store_true")
     parser.add_argument("--plot-only", action="store_true",
                         help="Plot existing output-dir JSON/NPZ without rerunning the model.")
-    parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
 
@@ -46,14 +44,6 @@ def dtype_from_name(name: str) -> torch.dtype:
     if name == "float32":
         return torch.float32
     raise ValueError(name)
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 
 def make_prompt(tokenizer, context_tokens: int, needle_pos_frac: float,
@@ -207,7 +197,6 @@ def maybe_plot(attribution: np.ndarray, spans: dict[str, int], out_png: Path):
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    set_seed(args.seed)
     if args.plot_only:
         json_path = args.output_dir / "needle_grad_attribution.json"
         npz_path = args.output_dir / "needle_grad_attribution.npz"
@@ -247,7 +236,6 @@ def main() -> None:
         "context_tokens_requested": args.context_tokens,
         "needle_pos_frac": args.needle_pos_frac,
         "answer": args.answer,
-        "seed": args.seed,
         "generated_check": generated_check,
         "spans": spans,
         **meta,
